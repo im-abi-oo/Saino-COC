@@ -9,9 +9,10 @@ env:
   PYTHON_VERSION: '3.11'
   MAIN_SCRIPT: 'main.py'
   DIST_DIR: 'dist'
-  PIP_CACHE_DIR: '.gha-cache/pip'
-  NUITKA_CACHE_DIR: '.gha-cache/nuitka'
+  PIP_CACHE_PATH: '.gha-cache/pip'
+  NUITKA_CACHE_PATH: '.gha-cache/nuitka'
   OUTPUT_EXE_NAME: 'Saino COC.exe'
+  ICON_PATH: ''   # اگر آیکون داری اینجا بزن، در غیر اینصورت خالی بذار
 
 jobs:
   build-windows-exe:
@@ -20,79 +21,153 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Ensure cache dirs exist
+      - name: Ensure local cache dirs exist
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path $env:PIP_CACHE_DIR -Force | Out-Null
-          New-Item -ItemType Directory -Path $env:NUITKA_CACHE_DIR -Force | Out-Null
-          Write-Host "PIP cache: $env:PIP_CACHE_DIR"
-          Write-Host "Nuitka cache: $env:NUITKA_CACHE_DIR"
+          New-Item -ItemType Directory -Path $env:PIP_CACHE_PATH -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:NUITKA_CACHE_PATH -Force | Out-Null
+          Write-Host "PIP cache: $env:PIP_CACHE_PATH"
+          Write-Host "Nuitka cache: $env:NUITKA_CACHE_PATH"
 
-      - name: Cache pip wheels
+      - name: Create Python script to generate requirements.txt from main.py
+        shell: pwsh
+        run: |
+          $py = @'
+import re, os, sys
+src = os.path.join(os.getcwd(), os.environ.get("MAIN_SCRIPT","main.py"))
+mapping = {
+    "PySide6":"PySide6",
+    "PySide2":"PySide2",
+    "PIL":"Pillow",
+    "Pillow":"Pillow",
+    "img2pdf":"img2pdf",
+    "fitz":"PyMuPDF",
+    "pypdf":"pypdf",
+    "PyPDF2":"PyPDF2",
+    "patoolib":"patool",
+    "patool":"patool",
+    "torch":"torch",
+    "numpy":"numpy",
+    "cv2":"opencv-python",
+    "easyocr":"easyocr",
+    "deep_translator":"deep-translator",
+    "compileall":"",
+    "json":"","os":"","sys":"","re":"","shutil":"","tempfile":"","zipfile":"","subprocess":"","time":"","pathlib":"","typing":""
+}
+found = set()
+if not os.path.exists(src):
+    print("ERROR: source file not found:", src)
+    sys.exit(1)
+txt = open(src, 'r', encoding='utf-8').read()
+for m in re.finditer(r'^\s*(?:from|import)\s+([A-Za-z0-9_\.]+)', txt, re.M):
+    name = m.group(1).split('.')[0]
+    if name in mapping:
+        pkg = mapping[name]
+        if pkg:
+            found.add(pkg)
+    else:
+        # best-effort: skip obvious stdlib names (single-letter or lower-case heuristics)
+        if len(name) > 1 and name.isidentifier() and name[0].islower():
+            found.add(name)
+# Ensure build tools present
+found.add("nuitka")
+found.add("wheel")
+reqs = sorted(found)
+with open('requirements.txt','w',encoding='utf-8') as f:
+    for p in reqs:
+        f.write(p + "\\n")
+print("Generated requirements.txt:", reqs)
+'@
+          Set-Content -Path generate_reqs.py -Value $py -Encoding UTF8
+          Write-Host "Wrote generate_reqs.py"
+
+      - name: Run requirements generator
+        shell: pwsh
+        run: |
+          python generate_reqs.py
+          Write-Host "requirements.txt content:"
+          Get-Content requirements.txt
+
+      - name: Cache pip packages
         uses: actions/cache@v4
         with:
-          path: ${{ env.PIP_CACHE_DIR }}
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          path: ${{ env.PIP_CACHE_PATH }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: Cache Nuitka cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.NUITKA_CACHE_DIR }}
-          key: ${{ runner.os }}-nuitka-${{ hashFiles('**/*.py') }}
+          path: ${{ env.NUITKA_CACHE_PATH }}
+          key: ${{ runner.os }}-nuitka-${{ hashFiles('**/main.py','requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-nuitka-
 
-      - name: Ensure native toolchain & 7zip (MSVC usually available on runner)
+      - name: Ensure native toolchain & 7zip (MSVC or MinGW)
         shell: pwsh
         run: |
+          Write-Host "Checking for cl.exe (MSVC)..."
           if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
-            Write-Host "MSVC found (cl.exe)."
+            Write-Host "MSVC (cl.exe) found."
           } else {
-            Write-Warning "cl.exe not found. Attempting to install MinGW via Chocolatey (if available)."
+            Write-Warning "MSVC not found. Attempting MinGW via choco (if available)."
             if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install -y mingw --no-progress || Write-Warning "choco install mingw failed or already attempted"
+              choco install -y mingw --no-progress
             } else {
-              Write-Warning "Chocolatey not available; relying on runner-provided toolchain (windows-latest usually has MSVC)."
+              Write-Warning "Chocolatey not available; relying on runner toolchain (windows-latest normally has MSVC)."
             }
           }
           if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
             if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install -y 7zip.install --no-progress || Write-Warning "7zip install attempted"
+              choco install -y 7zip.install --no-progress
             } else {
-              Write-Warning "7z not found and choco not available."
+              Write-Warning "7zip not available."
             }
-          } else { Write-Host "7z found." }
+          } else {
+            Write-Host "7z found."
+          }
 
-      - name: Install Nuitka (uses pip cache)
+      - name: Install Python dependencies (from generated requirements.txt)
         shell: pwsh
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          # install nuitka into runner environment (required for build)
-          python -m pip install --upgrade nuitka --cache-dir "$env:PIP_CACHE_DIR"
-          # optional useful plugins; ignore error if not available
-          python -m pip install --upgrade nuitka-plugins --cache-dir "$env:PIP_CACHE_DIR" || Write-Warning "nuitka-plugins optional"
+          python -m pip install -r requirements.txt --cache-dir "$env:PIP_CACHE_PATH"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "pip install failed. Check logs."
+            exit $LASTEXITCODE
+          }
 
-      - name: Verify main.py exists
+      - name: Install/upgrade Nuitka (and ignore non-existent plugin package)
         shell: pwsh
         run: |
-          if (-not (Test-Path $env:MAIN_SCRIPT)) { Write-Error "File $env:MAIN_SCRIPT not found in repo root."; exit 1 }
-          Write-Host "Found $env:MAIN_SCRIPT"
+          python -m pip install --upgrade nuitka --cache-dir "$env:PIP_CACHE_PATH"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to install nuitka"
+            exit $LASTEXITCODE
+          }
+          # Do NOT attempt to pip install 'nuitka-plugins' (not on PyPI). If you need special plugins, handle separately.
+
+      - name: Prepare dist dir
+        shell: pwsh
+        run: |
+          $d = Join-Path $PWD $env:DIST_DIR
+          if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+          New-Item -ItemType Directory -Path $d | Out-Null
 
       - name: Build with Nuitka (onefile, standalone, pyside6 plugin)
         shell: pwsh
         env:
-          NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_DIR }}
+          NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_PATH }}
         run: |
           $script = $env:MAIN_SCRIPT
+          if (-not (Test-Path $script)) { Write-Error "Script $script not found"; exit 1 }
           $outdir = Join-Path $PWD $env:DIST_DIR
-          # build command (simple example you asked for)
           $args = @(
             "--onefile",
             "--standalone",
@@ -100,11 +175,19 @@ jobs:
             "--output-dir=" + $outdir,
             "--enable-plugin=pyside6",
             "--include-qt-plugins=platforms,styles",
-            "--follow-imports"
+            "--follow-imports",
+            "--jobs=2"
           )
+          if ($env:ICON_PATH -ne "") {
+            $args += ("--windows-icon-from-ico=" + $env:ICON_PATH)
+          }
           $cmd = "python -m nuitka " + ($args -join " ") + " " + $script
           Write-Host "Running: $cmd"
           iex $cmd
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Nuitka build failed (exit code $LASTEXITCODE)"
+            exit $LASTEXITCODE
+          }
 
       - name: Locate and rename EXE to final name
         shell: pwsh
@@ -116,13 +199,13 @@ jobs:
           Copy-Item $exe.FullName $dest -Force
           Write-Host "Copied $($exe.FullName) -> $dest"
 
-      - name: Zip dist and upload artifact
+      - name: Zip dist for artifact
         shell: pwsh
         run: |
+          $dist = Join-Path $PWD $env:DIST_DIR
           $zip = Join-Path $PWD "Saino_COC_dist.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
-          Compress-Archive -Path "$PWD\$env:DIST_DIR\*" -DestinationPath $zip
-          Write-Host "Created $zip"
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip
 
       - name: Upload artifacts (exe + zip)
         uses: actions/upload-artifact@v4
