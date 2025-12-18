@@ -9,7 +9,6 @@ env:
   PYTHON_VERSION: '3.11'
   MAIN_SCRIPT: 'main.py'
   DIST_DIR: 'dist'
-  OUTPUT_EXE_NAME: 'Saino COC.exe'
 
 jobs:
   build-nuitka:
@@ -29,8 +28,9 @@ jobs:
           pip install nuitka PySide6 Pillow zstandard ordered-set
 
       - name: Build with Nuitka (onefile)
+        shell: powershell
         run: |
-          python -m nuitka --onefile --standalone --follow-imports --enable-plugin=pyside6 --include-qt-plugins=platforms,styles --remove-output --output-dir=%DIST_DIR% %MAIN_SCRIPT%
+          python -m nuitka --onefile --standalone --follow-imports --enable-plugin=pyside6 --include-qt-plugins=platforms,styles --remove-output --output-dir=${{ env.DIST_DIR }} ${{ env.MAIN_SCRIPT }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
