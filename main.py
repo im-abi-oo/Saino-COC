@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Saino COC — Final v2 (Refactored & Persian texts fixed)
+Saino COC — Final
+Features in this final build:
+- Tree view (QTreeWidget): top-level nodes = groups (ZIP or folder), children = images. Clear which image belongs to which ZIP.
+- Natural numeric sorting for ZIPs and images inside them.
+- Ability to reorder groups (select group root + Move Up/Move Down) and reorder images within a group (select child + Move Up/Move Down).
+- Supports multi-ZIP selection; ZIPs are sorted numerically before extracting.
+- On Convert: if multiple ZIP groups detected, a bilingual dialog asks whether to create separate PDFs per group or combine into a single PDF. Buttons and dialogs are fully bilingual (EN/FA). Toggle language with Ctrl+L.
+- Conversion runs in a background QThread to avoid UI freeze.
+- Memory optimization: scaled JPEGs are written to temp, then assembled into PDFs; temp cleaned up and GC run.
+- Estimated final size shown before conversion.
 
-What I changed in this update (per your request):
-- Fixed full bilingual support (all dialogs, buttons and prompts use localized Persian/English strings). No built-in "Yes/No" left untranslated — dialogs use self.t(...) labels everywhere.
-- Restored and improved PDF size estimation (shows human-readable estimate before conversion).
-- Kept per-group temp folders and combined-mode/global numbering behavior from previous v2.
-- Numbering in the UI has been preserved/updated so that displayed numbers match the filenames that will be used during conversion.
-- All other performance/memory optimizations kept (background QThread, temp cleanup, scaled JPEG intermediates).
+Usage:
+- Load Folder: adds a group (folder name) with its images (numeric-sorted).
+- Load ZIP(s): select multiple ZIP files; they will be natural-sorted (CH1, CH2, CH10) and each becomes a group.
+- Drag & drop ZIP(s) or folders or individual images — multiple ZIPs dropped together are sorted automatically.
+- Select a group (click group name) to move the whole group up/down using the same Move Up/Move Down buttons. Select an image (child) to move it within its group.
+- Double-click an image to preview it.
+- Press Ctrl+L to toggle English / Persian UI.
 
 Save as: saino_coc_final.py
 Requires: PySide6, Pillow
@@ -72,7 +82,6 @@ STRINGS = {
         'estimate_title': "Estimated size",
         'estimate_proceed': "Estimated total: {size}\nProceed?",
         'combined_name_info': "Combined filename will be: {name}.pdf",
-        'dropped_images': 'Dropped Images'
     },
     'fa': {
         'title': "Saino COC",
@@ -102,7 +111,6 @@ STRINGS = {
         'estimate_title': "حجم تقریبی",
         'estimate_proceed': "حجم تقریبی: {size}\nادامه می‌دهی؟",
         'combined_name_info': "نام فایل ترکیبی خواهد بود: {name}.pdf",
-        'dropped_images': 'تصاویر افتاده'
     }
 }
 
@@ -155,14 +163,13 @@ class ConversionWorker(QThread):
     finished_signal = Signal(list, list)
     error = Signal(str)
 
-    def __init__(self, groups_ordered, output_dir, scale, temp_dir, combined_name=None):
+    def __init__(self, groups_ordered, output_dir, scale, temp_dir):
         super().__init__()
         self.groups = groups_ordered
         self.output_dir = output_dir
         self.scale = scale
         self.temp_dir = temp_dir
         self._is_canceled = False
-        self.combined_name = combined_name
 
     def run(self):
         try:
@@ -175,7 +182,7 @@ class ConversionWorker(QThread):
                 if not paths:
                     continue
                 if group_name == '__COMBINED__':
-                    base = self.combined_name or f"combined_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    base = f"combined_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 else:
                     base = os.path.splitext(group_name)[0]
                 out_pdf = os.path.join(self.output_dir, f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
@@ -356,7 +363,7 @@ class ImageToPDF(QWidget):
             else:
                 if path.lower().endswith(('.png', '.jpg', '.jpeg')):
                     # add to a special "Dropped images" group
-                    self._ensure_group('__DROPPED__', self.t('dropped_images'))
+                    self._ensure_group('__DROPPED__', 'Dropped Images')
                     self._add_child('__DROPPED__', path)
         if zip_paths:
             zip_paths.sort(key=lambda p: natural_key(os.path.basename(p)))
@@ -366,7 +373,7 @@ class ImageToPDF(QWidget):
 
     # ------------ loading groups ------------
     def load_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, self.t('load_folder'))
+        folder = QFileDialog.getExistingDirectory(self, 'Choose Folder')
         if not folder: return
         self._add_folder_group(folder, clear_first=True)
 
@@ -383,7 +390,7 @@ class ImageToPDF(QWidget):
             self._add_child(basename, full)
 
     def load_zip(self):
-        files, _ = QFileDialog.getOpenFileNames(self, self.t('load_zip'), '', 'ZIP Files (*.zip)')
+        files, _ = QFileDialog.getOpenFileNames(self, 'Choose ZIP File(s)', '', 'ZIP Files (*.zip)')
         if not files: return
         files.sort(key=lambda p: natural_key(os.path.basename(p)))
         self.clear_all()
@@ -393,8 +400,6 @@ class ImageToPDF(QWidget):
 
     def _add_zip_group(self, zip_path, clear_first=False):
         basename = os.path.basename(zip_path)
-        group_temp = os.path.join(self.temp_dir, os.path.splitext(basename)[0])
-        os.makedirs(group_temp, exist_ok=True)
         if clear_first:
             self.clear_all(); self.loaded_zip_order = [basename]
         try:
@@ -403,44 +408,21 @@ class ImageToPDF(QWidget):
                 names.sort(key=natural_key)
                 self._ensure_group(basename, basename)
                 for name in names:
-                    # extract into the group's temp dir to avoid collisions
-                    # ensure target path exists
-                    target = os.path.join(group_temp, os.path.basename(name))
-                    # if filename exists in temp, append counter
-                    base_name = os.path.splitext(os.path.basename(name))[0]
-                    ext = os.path.splitext(name)[1]
-                    counter = 0
-                    candidate = target
-                    while os.path.exists(candidate):
-                        counter += 1
-                        candidate = os.path.join(group_temp, f"{base_name}_{counter}{ext}")
-                    z.extract(name, group_temp)
-                    # if z.extract created nested path, resolve it to candidate
-                    extracted_path = os.path.join(group_temp, name)
-                    if os.path.exists(extracted_path) and extracted_path != candidate:
-                        try:
-                            os.makedirs(os.path.dirname(candidate), exist_ok=True)
-                            shutil.move(extracted_path, candidate)
-                            parent_dir = os.path.dirname(extracted_path)
-                            try:
-                                os.removedirs(parent_dir)
-                            except Exception:
-                                pass
-                        except Exception:
-                            candidate = extracted_path
-                    final_path = candidate if os.path.exists(candidate) else extracted_path
-                    self._add_child(basename, final_path)
+                    extracted = z.extract(name, self.temp_dir)
+                    self._add_child(basename, extracted)
         except Exception as e:
             QMessageBox.warning(self, self.t('title'), f"{self.t('zip_error')} {e}")
 
     # ------------ tree helpers ------------
     def _ensure_group(self, key, display_name):
+        # if group with basename exists, return; else create top-level item
         root = self._find_group_item(key)
         if root is None:
             root = QTreeWidgetItem(self.tree)
             root.setText(0, display_name)
             root.setData(0, Qt.UserRole, {'type': 'group', 'key': key})
             root.setExpanded(True)
+            # visual style
             root.setFirstColumnSpanned(True)
             font = root.font(0); font.setBold(True); root.setFont(0, font)
         return root
@@ -460,11 +442,10 @@ class ImageToPDF(QWidget):
             if root.child(i).data(0, Qt.UserRole).get('path') == child_path:
                 return
         child = QTreeWidgetItem(root)
-        orig = os.path.basename(child_path)
-        child.setData(0, Qt.UserRole, {'type': 'image', 'path': child_path, 'orig': orig})
+        child.setText(0, os.path.basename(child_path))
+        child.setData(0, Qt.UserRole, {'type': 'image', 'path': child_path})
         root.addChild(child)
         self.source_map[child_path] = group_key
-        self._update_group_numbering(root)
 
     # ------------ UI behavior ------------
     def on_item_double_click(self, item, col):
@@ -499,8 +480,6 @@ class ImageToPDF(QWidget):
             if idx > 0:
                 parent.removeChild(it)
                 parent.insertChild(idx - 1, it)
-                self._update_group_numbering(parent)
-        self._update_all_numbering()
 
     def move_down(self):
         it = self.tree.currentItem()
@@ -518,8 +497,6 @@ class ImageToPDF(QWidget):
             if idx < parent.childCount() - 1:
                 parent.removeChild(it)
                 parent.insertChild(idx + 1, it)
-                self._update_group_numbering(parent)
-        self._update_all_numbering()
 
     def remove_selected(self):
         it = self.tree.currentItem()
@@ -527,11 +504,15 @@ class ImageToPDF(QWidget):
         d = it.data(0, Qt.UserRole)
         if not d: return
         if d.get('type') == 'group':
+            # remove whole group
             idx = self.tree.indexOfTopLevelItem(it)
-            children = [it.child(i).data(0, Qt.UserRole).get('path') for i in range(it.childCount())]
             self.tree.takeTopLevelItem(idx)
-            for p in children:
-                try: del self.source_map[p]
+            # remove associated source_map entries
+            # iterate children paths
+            for i in range(it.childCount()):
+                child = it.child(i)
+                cp = child.data(0, Qt.UserRole).get('path')
+                try: del self.source_map[cp]
                 except: pass
         else:
             parent = it.parent()
@@ -539,32 +520,15 @@ class ImageToPDF(QWidget):
             parent.removeChild(it)
             try: del self.source_map[cp]
             except: pass
-            self._update_group_numbering(parent)
-        self._update_all_numbering()
 
     def clear_all(self):
         self.tree.clear(); self.source_map.clear(); self.loaded_zip_order = []
         self.preview_label.setText(self.t('preview'))
 
-    # ------------ numbering helpers ------------
-    def _update_group_numbering(self, group_item):
-        n = group_item.childCount()
-        width = max(3, len(str(max(1, n))))
-        for i in range(n):
-            ch = group_item.child(i)
-            d = ch.data(0, Qt.UserRole)
-            orig = d.get('orig')
-            label = f"{(i+1):0{width}d} - {orig}"
-            ch.setText(0, label)
-
-    def _update_all_numbering(self):
-        for i in range(self.tree.topLevelItemCount()):
-            self._update_group_numbering(self.tree.topLevelItem(i))
-
     # ------------ conversion UI flow ------------
     def convert_to_pdf(self):
-        # collect groups in tree order
-        groups = []
+        # gather groups in tree order
+        groups = []  # list of (group_name, [paths])
         for i in range(self.tree.topLevelItemCount()):
             root = self.tree.topLevelItem(i)
             d = root.data(0, Qt.UserRole)
@@ -583,6 +547,7 @@ class ImageToPDF(QWidget):
             QMessageBox.warning(self, self.t('title'), self.t('no_images'))
             return
 
+        # detect multiple groups
         multiple_groups = len(groups) > 1
         combine_mode = False
         if multiple_groups:
@@ -601,20 +566,24 @@ class ImageToPDF(QWidget):
 
         groups_ordered = []
         if multiple_groups and not combine_mode:
+            # keep groups in current tree order
             for gname, paths in groups:
-                groups_ordered.append((gname, list(paths)))
+                groups_ordered.append((gname, paths))
         else:
+            # single combined group in tree order
             all_paths = []
             for _, paths in groups:
                 all_paths.extend(paths)
             groups_ordered.append(('__COMBINED__', all_paths))
 
+        # estimate
         scale = self.quality_spin.value() / 100.0
         total_est = sum(estimate_pdf_size(pths, scale) for _, pths in groups_ordered)
 
+        # If combined and there are multiple group names, try to create meaningful filename
         combined_name = None
         if len(groups_ordered) == 1 and groups_ordered[0][0] == '__COMBINED__':
-            group_keys = [self.tree.topLevelItem(i).data(0, Qt.UserRole).get('key') for i in range(self.tree.topLevelItemCount())]
+            group_keys = [g.data(0, Qt.UserRole).get('key') for g in [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]]
             lcs = longest_common_substring(group_keys)
             if lcs and len(lcs) >= 3:
                 combined_name = lcs
@@ -625,80 +594,26 @@ class ImageToPDF(QWidget):
         if combined_name:
             est_text += "\n" + self.t('combined_name_info').format(name=combined_name)
 
-        # custom bilingual confirmation dialog for estimate
-        est_msg = QMessageBox(self)
-        est_msg.setWindowTitle(self.t('estimate_title'))
-        est_msg.setText(est_text)
-        btn_proceed = est_msg.addButton(self.t('yes'), QMessageBox.YesRole)
-        btn_cancel = est_msg.addButton(self.t('no'), QMessageBox.NoRole)
-        est_msg.exec()
-        if est_msg.clickedButton() != btn_proceed:
+        reply = QMessageBox.question(self, self.t('estimate_title'), est_text, QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
             return
 
-        work_temp_root = os.path.join(self.temp_dir, f"work_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        os.makedirs(work_temp_root, exist_ok=True)
-
-        final_groups_for_worker = []
-
-        if len(groups_ordered) == 1 and groups_ordered[0][0] == '__COMBINED__':
-            combined_temp = os.path.join(work_temp_root, 'combined')
-            os.makedirs(combined_temp, exist_ok=True)
-            all_paths = groups_ordered[0][1]
-            total = len(all_paths)
-            width = max(3, len(str(max(1, total))))
-            for idx, src in enumerate(all_paths):
-                num = f"{(idx+1):0{width}d}"
-                ext = os.path.splitext(src)[1].lower() or '.png'
-                dst = os.path.join(combined_temp, f"{num}{ext}")
-                try:
-                    shutil.copy2(src, dst)
-                except Exception:
-                    try:
-                        img = Image.open(src)
-                        rgb = img.convert('RGB') if img.mode != 'RGB' else img
-                        rgb.save(dst)
-                        img.close()
-                    except Exception:
-                        pass
-            temp_files = [os.path.join(combined_temp, f) for f in sorted(os.listdir(combined_temp))]
-            final_groups_for_worker.append((combined_name or '__combined__', temp_files))
-        else:
-            for gname, paths in groups_ordered:
-                grp_temp = os.path.join(work_temp_root, os.path.splitext(gname)[0])
-                os.makedirs(grp_temp, exist_ok=True)
-                total = len(paths)
-                width = max(3, len(str(max(1, total))))
-                for idx, src in enumerate(paths):
-                    num = f"{(idx+1):0{width}d}"
-                    ext = os.path.splitext(src)[1].lower() or '.png'
-                    dst = os.path.join(grp_temp, f"{num}{ext}")
-                    try:
-                        shutil.copy2(src, dst)
-                    except Exception:
-                        try:
-                            img = Image.open(src)
-                            rgb = img.convert('RGB') if img.mode != 'RGB' else img
-                            rgb.save(dst)
-                            img.close()
-                        except Exception:
-                            pass
-                temp_files = [os.path.join(grp_temp, f) for f in sorted(os.listdir(grp_temp))]
-                final_groups_for_worker.append((gname, temp_files))
-
+        # prepare worker
         out_dir = os.path.join(os.getcwd(), 'output_pdfs'); os.makedirs(out_dir, exist_ok=True)
         self.progress_bar.setVisible(True)
-        max_images = max((len(p) for _, p in final_groups_for_worker), default=1)
+        max_images = max((len(p) for _, p in groups_ordered), default=1)
         self.progress_bar.setMaximum(max_images)
         self.progress_bar.setValue(0)
         self.convert_btn.setEnabled(False)
 
-        self.worker = ConversionWorker(groups_ordered=final_groups_for_worker, output_dir=out_dir, scale=scale, temp_dir=work_temp_root, combined_name=combined_name)
+        self.worker = ConversionWorker(groups_ordered=groups_ordered, output_dir=out_dir, scale=scale, temp_dir=self.temp_dir)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_signal.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
         self.worker.start()
 
-        self._worker_work_root = work_temp_root
+        # store combined_name to rename later
+        self._combined_name = combined_name
 
     def _on_progress(self, v):
         if v == 0:
@@ -711,17 +626,25 @@ class ImageToPDF(QWidget):
         self._cleanup_after_worker()
 
     def _on_finished(self, created_pdfs, skipped_all):
-        try:
-            if hasattr(self, '_worker_work_root') and os.path.exists(self._worker_work_root):
-                shutil.rmtree(self._worker_work_root, ignore_errors=True)
-        except Exception:
-            pass
-
         self._cleanup_after_worker()
         if not created_pdfs:
             QMessageBox.warning(self, self.t('title'), self.t('no_valid'))
             return
 
+        # if combined and single created name, rename to combined_name if available
+        if len(created_pdfs) == 1 and getattr(self, '_combined_name', None):
+            cur = created_pdfs[0]
+            dirp = os.path.dirname(cur)
+            new = os.path.join(dirp, f"{self._combined_name}.pdf")
+            try:
+                if os.path.exists(new):
+                    new = os.path.join(dirp, f"{self._combined_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+                os.rename(cur, new)
+                created_pdfs[0] = new
+            except Exception:
+                pass
+
+        # dialog (bilingual)
         msg = QMessageBox(self); msg.setWindowTitle(self.t('open_options_title'))
         if len(created_pdfs) == 1:
             msg.setText(f"{self.t('created')}\n{created_pdfs[0]}")
@@ -729,7 +652,8 @@ class ImageToPDF(QWidget):
         else:
             msg.setText(f"{len(created_pdfs)} PDFs created.")
             btn_open = None
-        btn_open_folder = msg.addButton(self.t('open_folder'), QMessageBox.AcceptRole); btn_close = msg.addButton(self.t('close'), QMessageBox.RejectRole)
+        btn_open_folder = msg.addButton(self.t('open_folder'), QMessageBox.AcceptRole)
+        btn_close = msg.addButton(self.t('close'), QMessageBox.RejectRole)
         msg.exec()
         clicked = msg.clickedButton()
         if clicked == btn_open and btn_open is not None:
@@ -803,4 +727,11 @@ class ImageToPDF(QWidget):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception:
             pass
-        super().close
+        super().closeEvent(ev)
+
+# ---------- run ----------
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    w = ImageToPDF()
+    w.show()
+    sys.exit(app.exec())
