@@ -1,4 +1,4 @@
-name: Build Saino COC (Nuitka) - main.py
+name: Build Saino COC (Nuitka, debug-friendly)
 
 on:
   push:
@@ -12,14 +12,13 @@ env:
   PIP_CACHE_DIR: '.gha-cache/pip'
   NUITKA_CACHE_DIR: '.gha-cache/nuitka'
   OUTPUT_EXE_NAME: 'Saino COC.exe'
-  # اگر آیکون داری اینجا مسیرش رو بذار (مثال: resources/icon.ico)
   ICON_PATH: ''
 
 jobs:
-  build-windows-exe:
+  build-windows:
     runs-on: windows-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -27,72 +26,51 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Ensure cache folders exist
+      - name: Ensure cache dirs
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "${{ env.PIP_CACHE_DIR }}" -Force | Out-Null
           New-Item -ItemType Directory -Path "${{ env.NUITKA_CACHE_DIR }}" -Force | Out-Null
-          Write-Host "PIP cache: $env:PIP_CACHE_DIR"
-          Write-Host "Nuitka cache: $env:NUITKA_CACHE_DIR"
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.PIP_CACHE_DIR }}
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/main.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Cache Nuitka cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.NUITKA_CACHE_DIR }}
-          key: ${{ runner.os }}-nuitka-${{ hashFiles('**/main.py') }}
-          restore-keys: |
-            ${{ runner.os }}-nuitka-
-
-      - name: Ensure native toolchain & 7zip (MSVC or MinGW)
-        shell: pwsh
-        run: |
-          Write-Host "Checking for cl.exe (MSVC)..."
-          if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
-            Write-Host "MSVC (cl.exe) found."
-          } else {
-            Write-Warning "cl.exe not found. Attempting to install MinGW via Chocolatey (if available)."
-            if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install -y mingw --no-progress || Write-Warning "choco mingw attempted"
-            } else {
-              Write-Warning "Chocolatey not available; relying on runner toolchain (windows-latest usually has MSVC)."
-            }
-          }
-          if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
-            if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install -y 7zip.install --no-progress || Write-Warning "choco 7zip attempted"
-            } else {
-              Write-Warning "7z not available and choco not present."
-            }
-          } else {
-            Write-Host "7z found."
-          }
-
-      - name: Install Python packages (direct pip install)
+      - name: Install runtime packages (direct pip install)
         shell: pwsh
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          # بسته‌های پیشنهادی بر اساس importهای داخل main.py
-          python -m pip install --upgrade PySide6 Pillow img2pdf pypdf PyPDF2 patool PyMuPDF nuitka wheel --cache-dir "${{ env.PIP_CACHE_DIR }}"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "pip install failed (exit code $LASTEXITCODE). Check logs."
-            exit $LASTEXITCODE
+          # install packages that main.py may need; add/remove if your code uses others
+          python -m pip install --upgrade PySide6 Pillow img2pdf pypdf PyPDF2 patool PyMuPDF --cache-dir "${{ env.PIP_CACHE_DIR }}"
+          if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+
+      - name: Show installed packages & PySide6 version
+        shell: pwsh
+        run: |
+          python -V
+          pip list
+          try {
+            python -c "import PySide6, sys; print('PySide6', PySide6.__version__)"
+          } catch {
+            Write-Warning "PySide6 import failed - check installation"
+            python -c "import traceback, sys; traceback.print_exc()"
+            exit 1
           }
+
+      - name: Install Nuitka
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade nuitka --cache-dir "${{ env.PIP_CACHE_DIR }}"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Failed to install nuitka"; exit $LASTEXITCODE }
+
+      - name: Ensure native toolchain & 7zip
+        shell: pwsh
+        run: |
+          if (Get-Command cl.exe -ErrorAction SilentlyContinue) { Write-Host "MSVC found." } else { Write-Warning "MSVC not found on PATH." }
+          if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) { Write-Warning "7z not found." } else { Write-Host "7z found." }
 
       - name: Verify main.py exists
         shell: pwsh
         run: |
-          if (-not (Test-Path $env:MAIN_SCRIPT)) { Write-Error "File $env:MAIN_SCRIPT not found in repo root."; exit 1 }
-          Write-Host "Found $env:MAIN_SCRIPT"
+          if (-not (Test-Path $env:MAIN_SCRIPT)) { Write-Error "File $env:MAIN_SCRIPT not found in repo root."; exit 1 } else { Write-Host "Found $env:MAIN_SCRIPT" }
 
-      - name: Build with Nuitka (onefile, standalone, pyside6 plugin)
+      - name: Build with Nuitka (standalone, verbose — debug friendly)
         shell: pwsh
         env:
           NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_DIR }}
@@ -103,48 +81,73 @@ jobs:
           New-Item -ItemType Directory -Path $outdir | Out-Null
 
           $args = @(
-            "--onefile",
             "--standalone",
             "--remove-output",
             "--output-dir=" + $outdir,
             "--enable-plugin=pyside6",
             "--include-qt-plugins=platforms,styles",
             "--follow-imports",
+            "--verbose",
             "--jobs=2"
           )
-          if ($env:ICON_PATH -ne "") {
-            $args += ("--windows-icon-from-ico=" + $env:ICON_PATH)
-          }
+          # For debugging keep folder mode (no --onefile). If this passes, we can add --onefile later.
           $cmd = "python -m nuitka " + ($args -join " ") + " " + $script
-          Write-Host "Running: $cmd"
+          Write-Host "Running Nuitka:"
+          Write-Host $cmd
           iex $cmd
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Nuitka build failed (exit code $LASTEXITCODE)"
-            exit $LASTEXITCODE
+          $code = $LASTEXITCODE
+          Write-Host "Nuitka exit code: $code"
+          if ($code -ne 0) {
+            Write-Error "Nuitka build failed with exit code $code. Showing dist folder and recent logs to help debugging."
+            # show dist contents (if any)
+            if (Test-Path $outdir) {
+              Write-Host "=== dist tree ==="
+              Get-ChildItem -Recurse -Force $outdir | Select-Object FullName,Length | Format-Table -AutoSize
+            } else {
+              Write-Host "dist directory not created."
+            }
+            # try to find any nuitka-log files
+            $logs = Get-ChildItem -Path . -Filter "*nuitka*" -Recurse -ErrorAction SilentlyContinue
+            if ($logs) {
+              Write-Host "=== Found potential log files: ==="
+              $logs | ForEach-Object { Write-Host $_.FullName; Get-Content -Path $_.FullName -TotalCount 200 }
+            }
+            exit $code
+          } else {
+            Write-Host "Nuitka build succeeded (standalone)."
           }
 
-      - name: Locate and rename EXE to final name
+      - name: (Optional) Copy exe to final name if onefile created
         shell: pwsh
         run: |
           $dist = Join-Path $PWD $env:DIST_DIR
+          # find exe inside dist folder (standalone mode creates a folder with an exe inside)
           $exe = Get-ChildItem -Path $dist -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { Write-Error "No exe found in $dist"; exit 1 }
-          $dest = Join-Path $dist $env:OUTPUT_EXE_NAME
-          Copy-Item $exe.FullName $dest -Force
-          Write-Host "Copied $($exe.FullName) -> $dest"
+          if ($exe) {
+            $dest = Join-Path $dist $env:OUTPUT_EXE_NAME
+            Copy-Item $exe.FullName $dest -Force
+            Write-Host "Copied $($exe.FullName) -> $dest"
+          } else {
+            Write-Warning "No exe found to rename (standalone build may have created a folder)."
+          }
 
       - name: Zip dist and upload artifact
         shell: pwsh
         run: |
+          $dist = Join-Path $PWD $env:DIST_DIR
           $zip = Join-Path $PWD "Saino_COC_dist.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
-          Compress-Archive -Path (Join-Path $PWD $env:DIST_DIR + "\*") -DestinationPath $zip
-          Write-Host "Created $zip"
+          if (Test-Path $dist) {
+            Compress-Archive -Path "$dist\*" -DestinationPath $zip
+            Write-Host "Created $zip"
+          } else {
+            Write-Warning "Dist folder missing; nothing to zip."
+          }
 
-      - name: Upload artifacts (exe + zip)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Saino-COC-release
           path: |
-            ${{ env.DIST_DIR }}\${{ env.OUTPUT_EXE_NAME }}
+            ${{ env.DIST_DIR }}
             Saino_COC_dist.zip
