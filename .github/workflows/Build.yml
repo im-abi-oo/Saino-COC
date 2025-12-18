@@ -1,20 +1,17 @@
-name: Build Saino COC (Windows, Nuitka) - main.py
+name: Build Saino COC (Nuitka) - main.py
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
 
-# متغیرهای عمومی
 env:
   PYTHON_VERSION: '3.11'
   MAIN_SCRIPT: 'main.py'
-  OUTPUT_EXE_NAME: 'Saino COC.exe'
   DIST_DIR: 'dist'
-  # مسیرهای کش داخل workspace (قابل استفاده در actions/cache)
-  PIP_CACHE_PATH: '.gha-cache/pip'
-  NUITKA_CACHE_PATH: '.gha-cache/nuitka'
-  ICON_PATH: '' # در صورت داشتن آیکون مسیرش را اینجا قرار بده (مثلاً 'resources/icon.ico')
+  PIP_CACHE_DIR: '.gha-cache/pip'
+  NUITKA_CACHE_DIR: '.gha-cache/nuitka'
+  OUTPUT_EXE_NAME: 'Saino COC.exe'
 
 jobs:
   build-windows-exe:
@@ -23,158 +20,88 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python ${{ env.PYTHON_VERSION }}
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Show basic info
-        run: |
-          python -V
-          echo "Main script: $MAIN_SCRIPT"
-          echo "PIP cache path: $PIP_CACHE_PATH"
-          echo "Nuitka cache path: $NUITKA_CACHE_PATH"
-        shell: bash
-
-      - name: Ensure cache folders exist
-        run: |
-          mkdir -p "${{ env.PIP_CACHE_PATH }}"
-          mkdir -p "${{ env.NUITKA_CACHE_PATH }}"
-        shell: bash
-
-      - name: Generate requirements.txt from imports (best-effort)
+      - name: Ensure cache dirs exist
         shell: pwsh
         run: |
-          python - <<'PY'
-          import re,sys,os
-          src = os.path.join(os.getcwd(), os.environ.get('MAIN_SCRIPT','main.py'))
-          mapping = {
-            "PySide6":"PySide6",
-            "PySide2":"PySide2",
-            "PIL":"Pillow",
-            "Pillow":"Pillow",
-            "img2pdf":"img2pdf",
-            "fitz":"PyMuPDF",
-            "pypdf":"pypdf",
-            "PyPDF2":"PyPDF2",
-            "patoolib":"patool",
-            "patool":"patool",
-            "torch":"torch",
-            "numpy":"numpy",
-            "cv2":"opencv-python",
-            "easyocr":"easyocr",
-            "deep_translator":"deep-translator"
-          }
-          found=set()
-          try:
-            with open(src, 'r', encoding='utf-8') as f:
-              txt=f.read()
-          except Exception as e:
-            print("Cannot open source file:", e); sys.exit(1)
-          for m in re.finditer(r'^\s*(?:from|import)\s+([A-Za-z0-9_\.]+)', txt, re.M):
-            name=m.group(1).split('.')[0]
-            if name in mapping:
-              pkg = mapping[name]
-              if pkg:
-                found.add(pkg)
-            else:
-              if len(name)>1 and name.isidentifier() and name[0].islower():
-                found.add(name)
-          # ensure build-time tools present
-          found.add("nuitka")
-          found.add("wheel")
-          with open('requirements.txt','w',encoding='utf-8') as f:
-            for p in sorted(found):
-              f.write(p + "\n")
-          print("Wrote requirements.txt with:", sorted(found))
-          PY
+          New-Item -ItemType Directory -Path $env:PIP_CACHE_DIR -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:NUITKA_CACHE_DIR -Force | Out-Null
+          Write-Host "PIP cache: $env:PIP_CACHE_DIR"
+          Write-Host "Nuitka cache: $env:NUITKA_CACHE_DIR"
 
-      - name: Show generated requirements
-        shell: cmd
-        run: type requirements.txt
-
-      - name: Cache pip packages
+      - name: Cache pip wheels
         uses: actions/cache@v4
         with:
-          path: ${{ env.PIP_CACHE_PATH }}
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Cache Nuitka object cache
+      - name: Cache Nuitka cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.NUITKA_CACHE_PATH }}
-          key: ${{ runner.os }}-nuitka-${{ hashFiles('**/main.py','requirements.txt') }}
+          path: ${{ env.NUITKA_CACHE_DIR }}
+          key: ${{ runner.os }}-nuitka-${{ hashFiles('**/*.py') }}
           restore-keys: |
             ${{ runner.os }}-nuitka-
 
-      - name: Ensure native build tools & 7zip (MSVC or MinGW via choco)
+      - name: Ensure native toolchain & 7zip (MSVC usually available on runner)
         shell: pwsh
         run: |
-          Write-Host "Checking for cl.exe (MSVC)..."
           if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
-            Write-Host "MSVC (cl.exe) found in PATH. Using MSVC."
+            Write-Host "MSVC found (cl.exe)."
           } else {
-            Write-Host "MSVC not found. Attempting to install MinGW via chocolatey (if available)."
+            Write-Warning "cl.exe not found. Attempting to install MinGW via Chocolatey (if available)."
             if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install -y mingw --no-progress || choco install -y mingw --no-progress
-              Write-Host "Attempted MinGW install. If compiler not found Nuitka may still try to download or fail."
+              choco install -y mingw --no-progress || Write-Warning "choco install mingw failed or already attempted"
             } else {
-              Write-Warning "choco not available: relying on runner toolchain. windows-latest normally has MSVC."
+              Write-Warning "Chocolatey not available; relying on runner-provided toolchain (windows-latest usually has MSVC)."
             }
           }
-          Write-Host "Ensuring 7zip (7z.exe) is available..."
           if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
             if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install -y 7zip.install --no-progress || Write-Warning "7zip install failed"
+              choco install -y 7zip.install --no-progress || Write-Warning "7zip install attempted"
             } else {
-              Write-Warning "7zip not installed and choco unavailable."
+              Write-Warning "7z not found and choco not available."
             }
-          } else {
-            Write-Host "7z found."
-          }
+          } else { Write-Host "7z found." }
 
-      - name: Install Python dependencies (pip) using cache dir
-        shell: cmd
+      - name: Install Nuitka (uses pip cache)
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -r requirements.txt --cache-dir "%CD%\${{ env.PIP_CACHE_PATH }}"
+          # install nuitka into runner environment (required for build)
+          python -m pip install --upgrade nuitka --cache-dir "$env:PIP_CACHE_DIR"
+          # optional useful plugins; ignore error if not available
+          python -m pip install --upgrade nuitka-plugins --cache-dir "$env:PIP_CACHE_DIR" || Write-Warning "nuitka-plugins optional"
 
-      - name: Install/upgrade Nuitka and plugins
-        shell: cmd
+      - name: Verify main.py exists
+        shell: pwsh
         run: |
-          python -m pip install --upgrade nuitka --cache-dir "%CD%\${{ env.PIP_CACHE_PATH }}"
-          python -m pip install --upgrade nuitka-plugins --cache-dir "%CD%\${{ env.PIP_CACHE_PATH }}" || echo "nuitka-plugins optional"
+          if (-not (Test-Path $env:MAIN_SCRIPT)) { Write-Error "File $env:MAIN_SCRIPT not found in repo root."; exit 1 }
+          Write-Host "Found $env:MAIN_SCRIPT"
 
-      - name: Prepare dist dir
-        shell: cmd
-        run: |
-          if exist %DIST_DIR% rmdir /s /q %DIST_DIR%
-          mkdir %DIST_DIR%
-
-      - name: Build with Nuitka (onefile, pyside6 plugin)
+      - name: Build with Nuitka (onefile, standalone, pyside6 plugin)
         shell: pwsh
         env:
-          NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_PATH }}
+          NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_DIR }}
         run: |
-          $script = "${{ env.MAIN_SCRIPT }}"
-          $outdir = Join-Path $PWD "${{ env.DIST_DIR }}"
+          $script = $env:MAIN_SCRIPT
+          $outdir = Join-Path $PWD $env:DIST_DIR
+          # build command (simple example you asked for)
           $args = @(
             "--onefile",
+            "--standalone",
             "--remove-output",
             "--output-dir=" + $outdir,
-            "--windows-disable-console",
             "--enable-plugin=pyside6",
             "--include-qt-plugins=platforms,styles",
             "--follow-imports"
           )
-          # add icon if provided
-          if ("${{ env.ICON_PATH }}" -ne "") {
-            $args += "--windows-icon-from-ico=${{ env.ICON_PATH }}"
-          }
-          # allow some parallelism
-          $args += "--jobs=2"
           $cmd = "python -m nuitka " + ($args -join " ") + " " + $script
           Write-Host "Running: $cmd"
           iex $cmd
@@ -182,24 +109,20 @@ jobs:
       - name: Locate and rename EXE to final name
         shell: pwsh
         run: |
-          $dist = Join-Path $PWD "${{ env.DIST_DIR }}"
+          $dist = Join-Path $PWD $env:DIST_DIR
           $exe = Get-ChildItem -Path $dist -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) {
-            Write-Error "No exe found in $dist"
-            exit 1
-          }
-          $dest = Join-Path $dist "${{ env.OUTPUT_EXE_NAME }}"
+          if (-not $exe) { Write-Error "No exe found in $dist"; exit 1 }
+          $dest = Join-Path $dist $env:OUTPUT_EXE_NAME
           Copy-Item $exe.FullName $dest -Force
           Write-Host "Copied $($exe.FullName) -> $dest"
 
-      - name: Zip dist for artifact
+      - name: Zip dist and upload artifact
         shell: pwsh
         run: |
-          $dist = Join-Path $PWD "${{ env.DIST_DIR }}"
           $zip = Join-Path $PWD "Saino_COC_dist.zip"
-          if (Test-Path $zip) { Remove-Item $zip }
-          Compress-Archive -Path "$dist\*" -DestinationPath $zip
-          Write-Host "Zipped dist to $zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$PWD\$env:DIST_DIR\*" -DestinationPath $zip
+          Write-Host "Created $zip"
 
       - name: Upload artifacts (exe + zip)
         uses: actions/upload-artifact@v4
