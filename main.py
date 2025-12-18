@@ -1,20 +1,34 @@
+#!/usr/bin/env python3
 # main.py
-# Saino COC Ultimate v3.2 FINAL - Polished UI, Memory-safe, DPI default-preserve
-# Developer: im_abi + assistant (finalized)
+# Saino COC v4.1 - Final (Nuitka-ready)
+# Author: im_abi + assistant
+# Description: Full-featured Saino COC application: supports folders, archives, PDF input,
+# Contents editor, merge/separate, session, localization, memory-safe PDF output,
+# preserves library default DPI unless "Use custom DPI" is checked, cancel-safe, temp cleanup.
 
-import sys, os, re, shutil, tempfile, zipfile, subprocess, json, io, gc
+# ------------------ Build notes (Nuitka) ------------------
+# Recommended Nuitka command for a single-file executable (Windows example):
+#   nuitka --onefile --enable-plugin=pyside6 --include-package=pillow --output-dir=dist main.py
+# For icons and resources: add --windows-icon-from-ico=icon.ico
+# If using patool or fitz, ensure those packages are available in the build environment.
+# Test the script in Python before building with Nuitka.
+# ---------------------------------------------------------
+
+import sys, os, re, json, shutil, tempfile, zipfile, subprocess, compileall, gc
 from pathlib import Path
-from PIL import Image, ImageFile, ImageEnhance
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+from typing import List, Dict, Optional
 
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QPushButton, QVBoxLayout, QFileDialog, QListWidget, QLabel,
-    QMessageBox, QHBoxLayout, QAbstractItemView, QSpinBox, QFormLayout, QGroupBox,
-    QCheckBox, QProgressBar, QInputDialog, QDialog, QComboBox, QFrame, QTabWidget,
-    QScrollArea, QSlider, QSizePolicy, QSplitter, QStyle, QToolButton
+    QApplication, QWidget, QLabel, QListWidget, QPushButton, QVBoxLayout, QHBoxLayout,
+    QFileDialog, QProgressBar, QComboBox, QSpinBox, QCheckBox, QFormLayout, QGroupBox,
+    QMessageBox, QInputDialog, QDialog, QSlider, QTabWidget, QSplitter, QSizePolicy,
+    QAbstractItemView
 )
-from PySide6.QtGui import QFont, QPixmap, QAction
-from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtGui import QPixmap, QFont
+from PySide6.QtCore import Qt, QThread, Signal
+
+from PIL import Image, ImageFile, ImageEnhance
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Optional libs
 try:
@@ -24,586 +38,704 @@ except Exception:
     HAS_IMG2PDF = False
 
 try:
-    import fitz  # PyMuPDF
+    try:
+        from pypdf import PdfMerger
+        HAS_PYPDF = True
+    except Exception:
+        from PyPDF2 import PdfMerger  # type: ignore
+        HAS_PYPDF = True
+except Exception:
+    HAS_PYPDF = False
+
+try:
+    import fitz
     HAS_FITZ = True
 except Exception:
     HAS_FITZ = False
 
-# ---------------- CONFIG ----------------
-APP_NAME = "Saino COC Ultimate"
-VERSION = "3.2 FINAL"
-CONFIG_PATH = Path.home() / ".saino_coc_v3_config.json"
-SESSION_PATH = Path.home() / ".saino_coc_v3_session.json"
+try:
+    import patoolib
+    HAS_PATOOL = True
+except Exception:
+    HAS_PATOOL = False
+
+# ---------------- constants & config ----------------
+APP_NAME = "Saino COC"
+VERSION = "v4.1"
+HOME = Path.home()
+CONFIG_PATH = HOME / ".saino_coc_v4_config.json"
+SESSION_PATH = HOME / ".saino_coc_v4_session.json"
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
 CONTAINER_EXTS = {'.zip', '.cbz', '.rar', '.cbr', '.7z', '.tar'}
+PRIORITY_EXTS = set(list(CONTAINER_EXTS) + ['.pdf'])
 
 DEFAULT_CONFIG = {
     "language": "fa",
     "quality": 90,
-    "dpi": 300,
     "use_custom_dpi": False,
-    "grayscale": False,
-    "enhancement": {
-        "brightness": 1.0,
-        "contrast": 1.0,
-        "sharpness": 1.0,
-        "resize_w": 0
-    }
+    "dpi": 300,
+    "sort_mode": "Manual",
+    "enhancement": {"brightness":1.0, "contrast":1.0, "sharpness":1.0, "resize_w":0},
+    "grayscale": False
 }
 
-cconf = DEFAULT_CONFIG.copy()
-
-# ---------------- STYLES ----------------
-STYLESHEET = """
-QWidget { background: #0f1115; color: #e6eef2; font-family: 'Segoe UI', Roboto, Arial; }
-QTabWidget::pane { border: none; }
-QGroupBox { border: 1px solid #263238; border-radius: 8px; margin-top: 18px; color: #80deea; }
-QListWidget { background: #071016; border: 1px solid #263238; }
-QPushButton#Accent { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #006064, stop:1 #00acc1); color: white; padding:8px 14px; border-radius:8px; }
-QPushButton { background: #12171a; border: 1px solid #263238; padding:6px 10px; border-radius:6px; }
-QPushButton:hover { border-color: #00e5ff; }
-QProgressBar { background:#071016; border:1px solid #263238; height:18px; }
-QProgressBar::chunk { background: #00e5ff; }
-QLabel#Title { font-size:16pt; color:#00e5ff; font-weight:700 }
-"""
-
-# ---------------- UTIL ----------------
-def load_config():
-    global cconf
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                cconf.update(json.load(f))
-        except Exception:
-            pass
-
-
-def save_config():
+# -------------- helpers ----------------
+def load_json(path: Path, default):
     try:
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump(cconf, f, indent=2, ensure_ascii=False)
+        if path.exists():
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default.copy()
+
+def save_json(path: Path, obj):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
+CONFIG = load_json(CONFIG_PATH, DEFAULT_CONFIG)
+SESSION = load_json(SESSION_PATH, {"sources": []})
 
-def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+STRINGS = {
+    "en": {
+        "add":"Add","convert":"Convert","delete":"Delete","clear":"Clear All","sort":"Sort:",
+        "settings":"Settings","no_sources_msg":"No sources added.","separate":"Separate per source","merge":"Merge into one",
+        "output_format":"Output format","pdf":"PDF","cbz":"CBZ","merged_filename":"Merged filename",
+        "proposed_filename":"Proposed filename (edit if you want):","invalid_name":"Filename cannot be empty.",
+        "choose_output_folder":"Choose output folder","created":"Created:","no_outputs":"No outputs produced (error or cancelled).",
+        "extract_failed":"Cannot extract archive for inspection.","cannot_extract":"Cannot extract archive: install 7z or patool.",
+        "pdf_render_req":"PDF processing requires PyMuPDF (fitz).","ok":"OK","cancel":"Cancel","open_folder":"Open containing folder",
+        "open_file":"Open first output file","done":"Done","app_name":APP_NAME
+    },
+    "fa": {
+        "add":"افزودن","convert":"تبدیل","delete":"حذف","clear":"پاک کردن همه","sort":"مرتب‌سازی:",
+        "settings":"تنظیمات","no_sources_msg":"هیچ منبعی اضافه نشده است.","separate":"هر منبع جدا (تکی)","merge":"ادغام در یک فایل",
+        "output_format":"فرمت خروجی","pdf":"PDF","cbz":"CBZ","merged_filename":"نام فایل ادغام",
+        "proposed_filename":"نام پیشنهادی (در صورت نیاز ویرایش کنید):","invalid_name":"نام نمی‌تواند خالی باشد.",
+        "choose_output_folder":"پوشه خروجی را انتخاب کنید","created":"ساخته شد:","no_outputs":"هیچ فایلی ساخته نشد (خطا یا لغو).",
+        "extract_failed":"استخراج آرشیو برای بازبینی ممکن نیست.","cannot_extract":"استخراج آرشیو ممکن نیست: 7z یا patool نصب کنید.",
+        "pdf_render_req":"پردازش PDF نیاز به PyMuPDF (fitz) دارد.","ok":"تأیید","cancel":"انصراف","open_folder":"باز کردن پوشه حاوی خروجی",
+        "open_file":"باز کردن اولین فایل خروجی","done":"پایان","app_name":APP_NAME
+    }
+}
 
+def tr(key: str) -> str:
+    lang = CONFIG.get('language', 'fa')
+    return STRINGS.get(lang, STRINGS['fa']).get(key, key)
 
-def get_7z_path():
-    if sys.platform == 'win32':
-        p1 = Path("C:/Program Files/7-Zip/7z.exe")
-        if p1.exists(): return str(p1)
-    return '7z'
+def natural_sort_key(s: str):
+    return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', s)]
 
-# ---------------- IMAGE PROCESSOR ----------------
-class ImageProcessor:
-    @staticmethod
-    def process(path, cfg):
-        try:
-            with Image.open(path) as im:
-                # Mode
-                im = im.convert('L') if cfg.get('grayscale') else (im.convert('RGB') if im.mode not in ('RGB','L') else im.copy())
+def extract_last_number(s: str) -> Optional[int]:
+    nums = re.findall(r'(\d+)', s)
+    return int(nums[-1]) if nums else None
 
-                # Resize
-                rw = cfg['enhancement'].get('resize_w', 0)
-                if rw and im.width > rw:
-                    h = int(im.height * (rw / im.width))
-                    im = im.resize((rw, h), Image.Resampling.LANCZOS)
+def remove_numbers_from_name(s: str) -> str:
+    return re.sub(r'\d+', '', s).strip().strip('_- ')
 
-                # Enhancements
-                br = cfg['enhancement'].get('brightness', 1.0)
-                if br != 1.0: im = ImageEnhance.Brightness(im).enhance(br)
-                co = cfg['enhancement'].get('contrast', 1.0)
-                if co != 1.0: im = ImageEnhance.Contrast(im).enhance(co)
-                sh = cfg['enhancement'].get('sharpness', 1.0)
-                if sh != 1.0: im = ImageEnhance.Sharpness(im).enhance(sh)
+def run_7z_extract(archive_path: str, dest_dir: str) -> bool:
+    exe = shutil.which('7z') or shutil.which('7za')
+    if not exe:
+        return False
+    try:
+        cmd = [exe, 'x', '-y', f'-o{dest_dir}', archive_path]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return p.returncode == 0
+    except Exception:
+        return False
 
-                return im.copy()
-        except Exception as e:
-            print('ImageProcessor error:', e)
-            return None
+# ---------------- source & session ----------------
+_next_id = 1
 
-# ---------------- WORKER ----------------
-class SuperWorker(QThread):
+def make_source(path: str) -> Dict:
+    global _next_id
+    p = Path(path)
+    ext = p.suffix.lower()
+    if p.is_dir(): typ = 'folder'
+    elif ext == '.pdf': typ = 'pdf'
+    elif ext in CONTAINER_EXTS: typ = 'archive'
+    elif ext in IMAGE_EXTS: typ = 'image'
+    else: typ = 'other'
+    src = {'id': _next_id, 'path': path, 'type': typ, 'label': p.name, 'temp': None, 'content_override': None, 'added_at': None}
+    _next_id += 1
+    return src
+
+def session_save_sources(sources: List[Dict]):
+    serial = []
+    for s in sources:
+        copy = {k:v for k,v in s.items() if k != 'temp'}
+        serial.append(copy)
+    SESSION['sources'] = serial
+    save_json(SESSION_PATH, SESSION)
+
+def session_load_sources() -> List[Dict]:
+    return [s.copy() for s in SESSION.get('sources', [])]
+
+# ---------------- Contents Editor (same as classic) ----------------
+class ContentsEditor(QDialog):
+    def __init__(self, parent, src: Dict):
+        super().__init__(parent)
+        self.src = src
+        self.setWindowTitle(self.src.get('label', 'Contents'))
+        self.resize(700, 420)
+        self.working_dir: Optional[str] = None
+        self.files: List[str] = []
+
+        self.list_widget = QListWidget(); self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.sort_combo = QComboBox(); self.sort_combo.addItems(['Manual','Name (natural)','Number']); self.sort_combo.currentIndexChanged.connect(self.on_sort)
+        btn_up = QPushButton('⬆'); btn_down = QPushButton('⬇'); btn_delete = QPushButton(tr('delete'))
+        btn_ok = QPushButton(tr('ok') if tr('ok') else 'OK'); btn_cancel = QPushButton(tr('cancel') if tr('cancel') else 'Cancel')
+        btn_up.clicked.connect(self.move_up); btn_down.clicked.connect(self.move_down); btn_delete.clicked.connect(self.delete_selected)
+        btn_ok.clicked.connect(self.accept); btn_cancel.clicked.connect(self.reject)
+
+        top = QHBoxLayout(); top.addWidget(QLabel(tr('sort'))); top.addWidget(self.sort_combo); top.addStretch()
+        btn_row = QHBoxLayout(); btn_row.addWidget(btn_up); btn_row.addWidget(btn_down); btn_row.addWidget(btn_delete); btn_row.addStretch(); btn_row.addWidget(btn_ok); btn_row.addWidget(btn_cancel)
+        layout = QVBoxLayout(self); layout.addLayout(top); layout.addWidget(self.list_widget); layout.addLayout(btn_row)
+        self.prepare()
+
+    def prepare(self):
+        p = Path(self.src['path'])
+        if self.src['type'] == 'archive':
+            tmp = tempfile.mkdtemp(prefix='ex_contents_'); success=False
+            if HAS_PATOOL:
+                try:
+                    patoolib.extract_archive(self.src['path'], outdir=tmp, interactive=False); success=True
+                except Exception:
+                    success=False
+            if not success:
+                if run_7z_extract(self.src['path'], tmp): success=True
+            if not success:
+                try: shutil.unpack_archive(self.src['path'], tmp); success=True
+                except Exception: success=False
+            if not success:
+                QMessageBox.warning(self, tr('extract_failed'), tr('extract_failed')); self.working_dir=None; return
+            self.working_dir = tmp; self.src['temp'] = tmp
+        else:
+            self.working_dir = self.src['path']
+
+        if self.src.get('content_override'):
+            self.files = [f for f in self.src['content_override'] if os.path.exists(f)]
+        else:
+            collected=[]
+            if os.path.isdir(self.working_dir):
+                for name in sorted(os.listdir(self.working_dir), key=natural_sort_key):
+                    full = os.path.join(self.working_dir, name)
+                    if os.path.isdir(full):
+                        has_pr=False; has_im=False
+                        for r,d,fs in os.walk(full):
+                            for ff in fs:
+                                ext=os.path.splitext(ff)[1].lower()
+                                if ext in PRIORITY_EXTS: has_pr=True; break
+                                if ext in IMAGE_EXTS: has_im=True
+                            if has_pr: break
+                        if has_pr or has_im: collected.append(full)
+                    else:
+                        ext=os.path.splitext(name)[1].lower()
+                        if ext in PRIORITY_EXTS or ext in IMAGE_EXTS: collected.append(full)
+            else:
+                if os.path.isfile(self.working_dir): collected=[self.working_dir]
+            self.files = collected
+        self.reload()
+
+    def reload(self):
+        self.list_widget.clear()
+        for p in self.files:
+            label = os.path.basename(p)
+            if os.path.isdir(p): label=f'[Folder] {label}'
+            self.list_widget.addItem(label)
+
+    def move_up(self):
+        sel = sorted({idx.row() for idx in self.list_widget.selectedIndexes()})
+        if not sel: return
+        i = sel[0]
+        if i>0:
+            block=[self.files[j] for j in sel]
+            for j in reversed(sel): del self.files[j]
+            insert_at = sel[0]-1
+            for k,item in enumerate(block): self.files.insert(insert_at+k, item)
+            self.reload(); self.list_widget.setCurrentRow(insert_at)
+
+    def move_down(self):
+        sel = sorted({idx.row() for idx in self.list_widget.selectedIndexes()})
+        if not sel: return
+        i = sel[-1]
+        if i < len(self.files)-1:
+            block=[self.files[j] for j in sel]
+            for j in reversed(sel): del self.files[j]
+            insert_at = sel[-1]+1 - len(block) + 1
+            for k,item in enumerate(block): self.files.insert(insert_at+k, item)
+            self.reload(); self.list_widget.setCurrentRow(insert_at+len(block)-1)
+
+    def delete_selected(self):
+        sel = sorted({idx.row() for idx in self.list_widget.selectedIndexes()}, reverse=True)
+        for i in sel:
+            if 0<=i<len(self.files): del self.files[i]
+        self.reload()
+
+    def on_sort(self, _):
+        mode = self.sort_combo.currentText()
+        if mode=='Manual': return
+        if mode=='Name (natural)': self.files.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
+        elif mode=='Number':
+            def keyfn(p):
+                n = extract_last_number(os.path.basename(p))
+                return (n if n is not None else 10**9, natural_sort_key(os.path.basename(p)))
+            self.files.sort(key=keyfn)
+        self.reload()
+
+    def accept(self):
+        self.src['content_override'] = self.files.copy(); super().accept()
+
+# ---------------- Worker ----------------
+class BatchWorker(QThread):
     progress = Signal(int)
-    log = Signal(str)
+    message = Signal(str)
+    detailed = Signal(dict)
     finished = Signal(list)
 
-    def __init__(self, sources, out_dir, merge, fmt, out_name, cfg):
-        super().__init__()
-        self.sources = sources
-        self.out_dir = out_dir
-        self.merge = merge
-        self.fmt = fmt
-        self.out_name = out_name
-        self.cfg = cfg
-        self.cancel = False
-        self.temp_dirs = []
+    def __init__(self, sources: List[Dict], out_dir: str, merge: bool=False, out_format: str='PDF', quality: int=90, dpi: int=300):
+        super().__init__(); self.sources=sources; self.out_dir=out_dir; self.merge=merge; self.out_format=out_format.upper(); self.quality=quality; self.dpi=dpi
+        self._temp_dirs=[]; self._cancel=False
 
-    def stop(self):
-        self.cancel = True
+    def cancel(self): self._cancel=True
 
     def run(self):
-        outputs = []
+        outputs=[]
         try:
-            images_buffer = []
-            total = len(self.sources)
-            for i, s in enumerate(self.sources):
-                if self.cancel: break
-                self.log.emit(f"Processing [{i+1}/{total}]: {s['label']}")
-                imgs = self._gather_images(s)
-                if not imgs: continue
-                if self.merge:
-                    images_buffer.extend(imgs)
-                    self.progress.emit(int((i+1)/total*40))
+            os.makedirs(self.out_dir, exist_ok=True)
+            total=len(self.sources); processed=0
+            for si, src in enumerate(self.sources, start=1):
+                if self._cancel: break
+                label = src.get('label', os.path.basename(src.get('path','')))
+                self.message.emit(f"{si}/{total}: {label}")
+                items = src.get('content_override') or [src['path']]
+                all_images=[]
+                for it in items:
+                    if self._cancel: break
+                    imgs = self._gather_images_for_item(it)
+                    all_images.extend(imgs)
+                page_total=len(all_images)
+                self.detailed.emit({'source_index':si,'source_total':total,'page':0,'page_total':page_total})
+                if page_total==0:
+                    processed+=1; self.progress.emit(int(processed/total*100)); continue
+                base_name = remove_numbers_from_name(label) or f'source{si}'
+                out_name = base_name if not self.merge else 'merged'
+                if self._cancel: break
+                if self.out_format=='CBZ':
+                    op = self._make_cbz(all_images, self.out_dir, out_name)
+                    if op: outputs.append(op)
                 else:
-                    base = os.path.splitext(s['label'])[0]
-                    out = self._create_output(imgs, base)
-                    if out: outputs.append(out)
-                    self.progress.emit(int((i+1)/total*100))
-                    imgs.clear(); gc.collect()
-
-            if self.merge and images_buffer and not self.cancel:
-                self.log.emit('Finalizing merged output...')
-                final = self._create_output(images_buffer, self.out_name)
-                if final: outputs.append(final)
-                self.progress.emit(100)
-
+                    op = self._make_pdf(all_images, self.out_dir, out_name, si, total)
+                    if op: outputs.append(op)
+                if self._cancel: break
+                processed += 1; self.progress.emit(int(processed/total*100))
+            # merge
+            if self.merge and self.out_format=='PDF' and outputs and not self._cancel and HAS_PYPDF:
+                try:
+                    merged_path=os.path.join(self.out_dir,'merged.pdf'); merger=PdfMerger()
+                    for p in outputs:
+                        if self._cancel: break
+                        merger.append(p)
+                    if not self._cancel:
+                        with open(merged_path,'wb') as fh: merger.write(fh)
+                        merger.close(); outputs=[merged_path]; self.message.emit('Merged into merged.pdf')
+                except Exception as e: self.message.emit(f'Merge failed: {e}')
+            self._cleanup(); self.finished.emit(outputs if not self._cancel else [])
         except Exception as e:
-            self.log.emit(f'Error: {e}')
-        finally:
-            self._cleanup()
-            self.finished.emit(outputs)
+            self._cleanup(); self.message.emit(f'Worker error: {e}'); self.finished.emit([])
 
-    def _gather_images(self, src):
-        ptype = src['type']
-        path = src['path']
-        imgs = []
-
-        if ptype == 'folder':
-            for r, _, files in os.walk(path):
-                for f in sorted(files, key=natural_sort_key):
-                    if Path(f).suffix.lower() in IMAGE_EXTS:
-                        imgs.append(os.path.join(r, f))
-
-        elif ptype == 'archive':
-            tmp = tempfile.mkdtemp(prefix='saino_ext_')
-            self.temp_dirs.append(tmp)
-            extracted = False
-            try:
-                if shutil.which('7z'):
-                    exe = get_7z_path()
-                    subprocess.run([exe, 'x', '-y', f'-o{tmp}', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    extracted = True
-            except Exception:
-                extracted = False
-            if not extracted:
+    def _gather_images_for_item(self, item: str) -> List[str]:
+        imgs=[]
+        if os.path.isdir(item):
+            for name in sorted(os.listdir(item), key=natural_sort_key):
+                if self._cancel: break
+                full=os.path.join(item,name)
+                if os.path.isdir(full): imgs.extend(self._gather_images_for_item(full))
+                else:
+                    ext=os.path.splitext(name)[1].lower()
+                    if ext in IMAGE_EXTS: imgs.append(full)
+                    elif ext in PRIORITY_EXTS: imgs.extend(self._gather_images_for_item(full))
+        elif os.path.isfile(item):
+            ext=os.path.splitext(item)[1].lower()
+            if ext in IMAGE_EXTS: imgs.append(item)
+            elif ext=='.pdf':
+                if not HAS_FITZ: self.message.emit(tr('pdf_render_req')); return []
+                tmp=tempfile.mkdtemp(prefix='pdfimg_'); self._temp_dirs.append(tmp)
                 try:
-                    import patoolib
-                    patoolib.extract_archive(path, outdir=tmp, interactive=False)
-                    extracted = True
-                except Exception:
-                    pass
-
-            for r, _, files in os.walk(tmp):
-                for f in sorted(files, key=natural_sort_key):
-                    if Path(f).suffix.lower() in IMAGE_EXTS:
-                        imgs.append(os.path.join(r, f))
-
-        elif ptype == 'pdf':
-            if HAS_FITZ:
-                tmp = tempfile.mkdtemp(prefix='saino_pdf_')
-                self.temp_dirs.append(tmp)
-                try:
-                    doc = fitz.open(path)
-                    # If user set custom DPI, use it; otherwise preserve default by not passing dpi.
-                    use_custom = self.cfg.get('use_custom_dpi', False)
-                    target_dpi = int(self.cfg.get('dpi', 300))
-                    for idx, page in enumerate(doc):
-                        if self.cancel: break
-                        if use_custom:
-                            pix = page.get_pixmap(dpi=target_dpi)
-                        else:
-                            pix = page.get_pixmap()  # Keep library default resolution
-                        out = os.path.join(tmp, f'p_{idx:05d}.jpg')
-                        pix.save(out)
-                        imgs.append(out)
+                    doc=fitz.open(item); use_custom=CONFIG.get('use_custom_dpi',False); target_dpi=int(self.dpi)
+                    for i,page in enumerate(doc, start=1):
+                        if self._cancel: break
+                        pix = page.get_pixmap(dpi=target_dpi) if use_custom else page.get_pixmap()
+                        out=os.path.join(tmp, f"{i:04}.jpg"); pix.save(out); imgs.append(out)
                     doc.close()
-                except Exception as e:
-                    print('PDF extract err:', e)
-            else:
-                self.log.emit('PyMuPDF not installed — cannot extract PDF pages')
-
-        elif ptype == 'image':
-            imgs.append(path)
-
+                except Exception as e: self.message.emit(f'PDF render error: {e}')
+            elif ext in CONTAINER_EXTS:
+                tmp=tempfile.mkdtemp(prefix='ex_'); self._temp_dirs.append(tmp); success=False
+                if HAS_PATOOL:
+                    try: patoolib.extract_archive(item, outdir=tmp, interactive=False); success=True
+                    except Exception: success=False
+                if not success:
+                    if run_7z_extract(item,tmp): success=True
+                if not success:
+                    try: shutil.unpack_archive(item,tmp); success=True
+                    except Exception: success=False
+                if not success: self.message.emit(tr('cannot_extract')); return []
+                for root,_,files in os.walk(tmp):
+                    for f in sorted(files, key=natural_sort_key):
+                        if self._cancel: break
+                        if os.path.splitext(f)[1].lower() in IMAGE_EXTS: imgs.append(os.path.join(root,f))
         return imgs
 
-    def _create_output(self, image_paths, name):
-        if not image_paths: return None
-        target = os.path.join(self.out_dir, name)
+    def _make_cbz(self, images: List[str], out_dir: str, base_name: str) -> Optional[str]:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            out_path=os.path.join(out_dir, f"{base_name}.cbz")
+            with zipfile.ZipFile(out_path,'w',compression=zipfile.ZIP_STORED) as z:
+                for i,p in enumerate(images, start=1):
+                    if self._cancel: 
+                        try: z.close()
+                        except: pass
+                        try: os.remove(out_path)
+                        except: pass
+                        return None
+                    arc=f"{i:04}{os.path.splitext(p)[1].lower()}"
+                    try: z.write(p, arc)
+                    except Exception:
+                        try:
+                            im=Image.open(p); buf=tempfile.NamedTemporaryFile(delete=False,suffix='.jpg')
+                            im.convert('RGB').save(buf.name, format='JPEG', quality=self.quality); im.close(); z.write(buf.name, arc); os.unlink(buf.name)
+                        except Exception:
+                            pass
+            return out_path
+        except Exception as e:
+            self.message.emit(f'CBZ error: {e}'); return None
 
-        if self.fmt == 'FOLDER':
-            dest = target
-            os.makedirs(dest, exist_ok=True)
-            for idx, src in enumerate(image_paths):
-                if self.cancel: return None
-                processed = ImageProcessor.process(src, self.cfg)
-                if processed:
-                    outp = os.path.join(dest, f'{idx:05d}.jpg')
-                    processed.save(outp, quality=self.cfg.get('quality', 90))
-                    processed.close()
-            return dest
-
-        elif self.fmt == 'CBZ':
-            full = target + '.cbz'
-            with zipfile.ZipFile(full, 'w', zipfile.ZIP_STORED) as zf:
-                for idx, src in enumerate(image_paths):
-                    if self.cancel: break
-                    proc = ImageProcessor.process(src, self.cfg)
-                    if proc:
-                        buf = io.BytesIO()
-                        proc.save(buf, format='JPEG', quality=self.cfg.get('quality', 90))
-                        zf.writestr(f'{idx:05d}.jpg', buf.getvalue())
-                        proc.close()
-            return full
-
-        elif self.fmt == 'PDF':
-            full = target + '.pdf'
-            # Convert using img2pdf (memory efficient) if available
-            tmp_dir = tempfile.mkdtemp(prefix='saino_pdfout_')
-            try:
-                temp_files = []
-                for idx, src in enumerate(image_paths):
-                    if self.cancel: break
-                    proc = ImageProcessor.process(src, self.cfg)
-                    if proc:
-                        outp = os.path.join(tmp_dir, f'{idx:05d}.jpg')
-                        save_kwargs = {'quality': self.cfg.get('quality', 90)}
-                        # Only set dpi if user enabled custom DPI
-                        if self.cfg.get('use_custom_dpi'):
-                            dpi = int(self.cfg.get('dpi', 300))
-                            save_kwargs['dpi'] = (dpi, dpi)
-                        proc.save(outp, **save_kwargs)
-                        proc.close()
-                        temp_files.append(outp)
-                    self.progress.emit(int((idx+1)/len(image_paths)*80))
-
-                if not self.cancel:
-                    if HAS_IMG2PDF:
-                        with open(full, 'wb') as f:
-                            f.write(img2pdf.convert(temp_files))
-                    else:
-                        # Fallback: use PIL to make PDF (may be memory-heavier)
-                        first = None
-                        others = []
-                        for p in temp_files:
-                            try:
-                                im = Image.open(p).convert('RGB')
-                                if first is None:
-                                    first = im
-                                else:
-                                    others.append(im)
-                            except Exception:
-                                pass
-                        if first:
-                            first.save(full, 'PDF', save_all=True, append_images=others)
-                            first.close()
-                            for o in others: o.close()
-                return full if not self.cancel else None
-            finally:
-                try: shutil.rmtree(tmp_dir, ignore_errors=True)
+    def _make_pdf(self, images: List[str], out_dir: str, base_name: str, source_index: int, total_sources: int) -> Optional[str]:
+        try:
+            if not images: return None
+            os.makedirs(out_dir, exist_ok=True)
+            out_path=os.path.join(out_dir, f"{base_name}.pdf")
+            if self._cancel: return None
+            tmpdir=tempfile.mkdtemp(prefix='pdfout_'); self._temp_dirs.append(tmpdir); temp_files=[]
+            for idx, src in enumerate(images, start=1):
+                if self._cancel: break
+                proc = self._process_image_to_temp(src, tmpdir, idx)
+                if proc: temp_files.append(proc)
+                self.detailed.emit({'source_index':source_index,'source_total':total_sources,'page':idx,'page_total':len(images)})
+            if self._cancel: return None
+            if HAS_IMG2PDF:
+                try:
+                    with open(out_path,'wb') as fh: fh.write(img2pdf.convert([str(p) for p in temp_files]))
+                    return out_path
+                except Exception as e:
+                    self.message.emit(f'img2pdf failed, fallback PIL: {e}')
+            # PIL fallback
+            first=None; others=[]
+            for i,p in enumerate(temp_files):
+                if self._cancel: break
+                try:
+                    im=Image.open(p).convert('RGB')
+                    if i==0: first=im
+                    else: others.append(im)
+                except Exception:
+                    continue
+            if self._cancel:
+                try: 
+                    if first: first.close()
                 except: pass
+                for im in others:
+                    try: im.close()
+                    except: pass
+                return None
+            if first:
+                first.save(out_path, save_all=True, append_images=others, quality=self.quality)
+                try: first.close()
+                except: pass
+                for im in others:
+                    try: im.close()
+                    except: pass
+                return out_path
+            return None
+        finally:
+            pass
 
-        return None
+    def _process_image_to_temp(self, src_path: str, tmpdir: str, idx: int) -> Optional[str]:
+        try:
+            im = Image.open(src_path)
+            if CONFIG.get('grayscale', False): im = im.convert('L')
+            else:
+                if im.mode not in ('RGB','L'): im = im.convert('RGB')
+                else: im = im.copy()
+            rw = CONFIG.get('enhancement', {}).get('resize_w', 0)
+            if rw and im.width > rw:
+                h = int(im.height * (rw / im.width)); im = im.resize((rw,h), Image.Resampling.LANCZOS)
+            enh = CONFIG.get('enhancement', {}); br = enh.get('brightness',1.0); co = enh.get('contrast',1.0); sh = enh.get('sharpness',1.0)
+            if br != 1.0: im = ImageEnhance.Brightness(im).enhance(br)
+            if co != 1.0: im = ImageEnhance.Contrast(im).enhance(co)
+            if sh != 1.0: im = ImageEnhance.Sharpness(im).enhance(sh)
+            out = os.path.join(tmpdir, f"{idx:05d}.jpg")
+            save_kwargs={'quality': self.quality}
+            if CONFIG.get('use_custom_dpi', False): save_kwargs['dpi']=(int(self.dpi), int(self.dpi))
+            im.save(out, format='JPEG', **save_kwargs)
+            try: im.close()
+            except: pass
+            return out
+        except Exception as e:
+            self.message.emit(f'Image process error: {e}'); return None
 
     def _cleanup(self):
-        for d in self.temp_dirs:
+        for d in list(self._temp_dirs):
             try: shutil.rmtree(d, ignore_errors=True)
-            except: pass
-        gc.collect()
+            except Exception: pass
+        self._temp_dirs=[]; gc.collect()
 
-# ---------------- MAIN UI ----------------
+# ---------------- MainWindow (old layout vibe) ----------------
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        load_config()
         self.setWindowTitle(f"{APP_NAME} {VERSION}")
-        self.resize(1200, 780)
-        self.sources = []
-        self._setup_ui()
-        self._load_session()
+        # smaller window, not fullscreen, compact layout similar to original
+        self.resize(980, 700)
+        self.sources: List[Dict] = session_load_sources()
+        self.worker: Optional[BatchWorker] = None
+        self._build_ui()
         self._refresh_list()
 
-    def _setup_ui(self):
-        self.setStyleSheet(STYLESHEET)
+    def _build_ui(self):
+        font = QFont('Segoe UI', 10); self.setFont(font)
         main = QVBoxLayout(self)
 
-        title = QLabel(f"{APP_NAME} - {VERSION}")
-        title.setObjectName('Title')
-        title.setAlignment(Qt.AlignLeft)
-        main.addWidget(title)
+        # top toolbar (compact)
+        top = QHBoxLayout()
+        btn_add = QPushButton(tr('add')); btn_add.clicked.connect(self.action_add)
+        btn_del = QPushButton(tr('delete')); btn_del.clicked.connect(self.action_delete)
+        btn_clear = QPushButton(tr('clear')); btn_clear.clicked.connect(self.action_clear)
+        top.addWidget(btn_add); top.addWidget(btn_del); top.addWidget(btn_clear); top.addStretch()
+        main.addLayout(top)
 
+        # central split: list (left) + actions (right)
         splitter = QSplitter(Qt.Horizontal)
-
-        # Left: List + Toolbar
-        left = QWidget()
-        llay = QVBoxLayout(left)
-        toolbar = QHBoxLayout()
-        btn_add = QPushButton('Add Files/Folders')
-        btn_add.clicked.connect(self.add_files)
-        btn_del = QPushButton('Remove')
-        btn_del.clicked.connect(self.delete_items)
-        btn_clr = QPushButton('Clear')
-        btn_clr.clicked.connect(self.clear_all)
-        toolbar.addWidget(btn_add); toolbar.addWidget(btn_del); toolbar.addWidget(btn_clr)
-
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list_widget.itemSelectionChanged.connect(self._on_select)
-
-        llay.addLayout(toolbar)
+        left = QWidget(); llay = QVBoxLayout(left)
+        self.list_widget = QListWidget(); self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_widget.itemDoubleClicked.connect(self.action_edit_contents)
         llay.addWidget(self.list_widget)
 
-        # Action area
-        act = QHBoxLayout()
-        self.combo_mode = QComboBox(); self.combo_mode.addItems(['Separate','Merge'])
+        # action bar beneath list (compact)
+        action_row = QHBoxLayout()
+        self.combo_mode = QComboBox(); self.combo_mode.addItems([tr('separate'), tr('merge')])
         self.combo_fmt = QComboBox(); self.combo_fmt.addItems(['PDF','CBZ','FOLDER'])
-        self.btn_start = QPushButton('Start Processing'); self.btn_start.setObjectName('Accent'); self.btn_start.setMinimumHeight(44)
-        self.btn_start.clicked.connect(self.start_processing)
-        act.addWidget(QLabel('Mode:')); act.addWidget(self.combo_mode)
-        act.addWidget(QLabel('Format:')); act.addWidget(self.combo_fmt)
-        act.addStretch(); act.addWidget(self.btn_start)
+        self.btn_start = QPushButton('START PROCESSING'); self.btn_start.setStyleSheet('font-weight:700; background:#006064; color:white')
+        self.btn_start.setMinimumHeight(44); self.btn_start.clicked.connect(self.action_convert)
+        action_row.addWidget(QLabel('Mode:')); action_row.addWidget(self.combo_mode); action_row.addWidget(QLabel('Format:')); action_row.addWidget(self.combo_fmt); action_row.addStretch(); action_row.addWidget(self.btn_start)
+        llay.addLayout(action_row)
 
-        llay.addLayout(act)
         splitter.addWidget(left)
 
-        # Right: Preview + Log + Settings in Tabs
-        right = QTabWidget()
+        # right: preview + log + settings vertical
+        right = QWidget(); rlay = QVBoxLayout(right)
+        self.preview_label = QLabel('Preview'); self.preview_label.setAlignment(Qt.AlignCenter); self.preview_label.setMinimumSize(280,360)
+        rlay.addWidget(self.preview_label)
+        self.log_list = QListWidget(); self.log_list.setMaximumHeight(180)
+        rlay.addWidget(QLabel('Log:')); rlay.addWidget(self.log_list)
 
-        # Preview tab
-        tab_preview = QWidget(); pv_l = QVBoxLayout(tab_preview)
-        self.preview_label = QLabel('Select an item to preview'); self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(320,400)
-        pv_l.addWidget(self.preview_label)
-
-        # Log list
-        self.log_list = QListWidget()
-        pv_l.addWidget(QLabel('Log:'))
-        pv_l.addWidget(self.log_list)
-
-        right.addTab(tab_preview, 'Preview')
-
-        # Settings tab
-        tab_set = QWidget(); s_l = QVBoxLayout(tab_set)
-        form = QFormLayout()
-        self.spin_qual = QSpinBox(); self.spin_qual.setRange(10,100); self.spin_qual.setValue(cconf.get('quality',90))
-        self.chk_gray = QCheckBox('Grayscale'); self.chk_gray.setChecked(cconf.get('grayscale',False))
-        self.sl_bright = QSlider(Qt.Horizontal); self.sl_bright.setRange(5,30); self.sl_bright.setValue(int(cconf['enhancement'].get('brightness',1.0)*10))
-        self.sl_contrast = QSlider(Qt.Horizontal); self.sl_contrast.setRange(5,30); self.sl_contrast.setValue(int(cconf['enhancement'].get('contrast',1.0)*10))
-        self.sl_sharp = QSlider(Qt.Horizontal); self.sl_sharp.setRange(5,40); self.sl_sharp.setValue(int(cconf['enhancement'].get('sharpness',1.0)*10))
-        self.spin_resize = QSpinBox(); self.spin_resize.setRange(0,8000); self.spin_resize.setValue(cconf['enhancement'].get('resize_w',0)); self.spin_resize.setSuffix(' px')
-
-        # DPI control: default off -> preserve library default
-        self.chk_custom_dpi = QCheckBox('Use custom DPI (override PDF render)')
-        self.chk_custom_dpi.setChecked(cconf.get('use_custom_dpi', False))
-        self.spin_dpi = QSpinBox(); self.spin_dpi.setRange(72,1200); self.spin_dpi.setValue(cconf.get('dpi',300));
-        self.spin_dpi.setEnabled(self.chk_custom_dpi.isChecked())
-        self.chk_custom_dpi.toggled.connect(self.spin_dpi.setEnabled)
-
-        form.addRow('Quality (JPEG):', self.spin_qual)
-        form.addRow(self.chk_gray)
-        form.addRow('Brightness:', self.sl_bright)
-        form.addRow('Contrast:', self.sl_contrast)
-        form.addRow('Sharpness:', self.sl_sharp)
-        form.addRow('Resize Width:', self.spin_resize)
-        form.addRow(self.chk_custom_dpi)
-        form.addRow('DPI:', self.spin_dpi)
-
-        s_l.addLayout(form)
-        # Save settings button
-        btn_save_set = QPushButton('Save Settings'); btn_save_set.clicked.connect(self._save_settings)
-        s_l.addWidget(btn_save_set)
-        right.addTab(tab_set, 'Settings')
+        # settings compact
+        grp = QGroupBox(tr('settings')); f = QFormLayout()
+        self.quality_spin = QSpinBox(); self.quality_spin.setRange(10,100); self.quality_spin.setValue(CONFIG.get('quality',90))
+        self.custom_dpi_cb = QCheckBox('Use custom DPI'); self.custom_dpi_cb.setChecked(CONFIG.get('use_custom_dpi',False))
+        self.dpi_spin = QSpinBox(); self.dpi_spin.setRange(72,1200); self.dpi_spin.setValue(CONFIG.get('dpi',300)); self.dpi_spin.setEnabled(self.custom_dpi_cb.isChecked())
+        self.custom_dpi_cb.toggled.connect(self.dpi_spin.setEnabled)
+        self.gray_cb = QCheckBox('Grayscale'); self.gray_cb.setChecked(CONFIG.get('grayscale', False))
+        self.resize_spin = QSpinBox(); self.resize_spin.setRange(0,8000); self.resize_spin.setValue(CONFIG.get('enhancement',{}).get('resize_w',0)); self.resize_spin.setSuffix(' px')
+        self.b_slide = QSlider(Qt.Horizontal); self.b_slide.setRange(5,30); self.b_slide.setValue(int(CONFIG.get('enhancement',{}).get('brightness',1.0)*10))
+        self.c_slide = QSlider(Qt.Horizontal); self.c_slide.setRange(5,30); self.c_slide.setValue(int(CONFIG.get('enhancement',{}).get('contrast',1.0)*10))
+        self.s_slide = QSlider(Qt.Horizontal); self.s_slide.setRange(5,40); self.s_slide.setValue(int(CONFIG.get('enhancement',{}).get('sharpness',1.0)*10))
+        f.addRow('Quality:', self.quality_spin); f.addRow(self.custom_dpi_cb, self.dpi_spin); f.addRow(self.gray_cb); f.addRow('Resize:', self.resize_spin)
+        f.addRow('Brightness:', self.b_slide); f.addRow('Contrast:', self.c_slide); f.addRow('Sharpness:', self.s_slide)
+        btn_save = QPushButton('Save settings'); btn_save.clicked.connect(self.save_settings); f.addRow(btn_save)
+        grp.setLayout(f); rlay.addWidget(grp)
 
         splitter.addWidget(right)
         main.addWidget(splitter)
 
-        # Footer: Progress + Cancel
-        footer = QHBoxLayout()
-        self.progress = QProgressBar(); self.progress.setValue(0); self.progress.setVisible(False)
-        self.btn_cancel = QPushButton('Cancel'); self.btn_cancel.setEnabled(False); self.btn_cancel.clicked.connect(self._cancel)
-        footer.addWidget(self.progress); footer.addWidget(self.btn_cancel)
-        main.addLayout(footer)
+        # footer: progress + cancel + attribution (small and centered)
+        fb = QHBoxLayout(); self.progress = QProgressBar(); self.progress.setVisible(False); self.cancel_btn = QPushButton('Cancel'); self.cancel_btn.setEnabled(False); self.cancel_btn.clicked.connect(self.action_cancel)
+        fb.addWidget(self.progress); fb.addWidget(self.cancel_btn)
+        main.addLayout(fb)
 
-    # --- Session & Sources ---
-    def _add_src(self, path):
-        if any(s['path'] == path for s in self.sources): return
-        p = Path(path)
-        ptype = 'other'
-        if p.is_dir(): ptype = 'folder'
-        elif p.suffix.lower() in CONTAINER_EXTS: ptype = 'archive'
-        elif p.suffix.lower() == '.pdf': ptype = 'pdf'
-        elif p.suffix.lower() in IMAGE_EXTS: ptype = 'image'
-        self.sources.append({'path': str(path), 'type': ptype, 'label': p.name})
+        footer_lbl = QLabel('ساخته شده توسط 𝕊𝕒𝕚𝕟𝕠™ دولوپر𝕚𝕞_𝕒𝕓𝕚🌙')
+        footer_lbl.setAlignment(Qt.AlignRight); footer_lbl.setStyleSheet('color:#00bcd4; font-family: Consolas; font-size:11px')
+        main.addWidget(footer_lbl)
 
-    def add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, 'Add', '', 'Files (*.zip *.cbz *.rar *.pdf *.jpg *.png *.webp *.bmp *.tiff)')
-        for f in files: self._add_src(f)
-        self._refresh_list(); self._save_session()
+        # store refs
+        self.enh_b_slider = self.b_slide; self.enh_c_slider = self.c_slide; self.enh_s_slider = self.s_slide
 
-    def delete_items(self):
-        rows = sorted([i.row() for i in self.list_widget.selectedIndexes()], reverse=True)
-        for r in rows:
-            if r < len(self.sources): del self.sources[r]
-        self._refresh_list(); self._save_session()
+    # UI actions
+    def action_add(self):
+        mb = QMessageBox(self); mb.setWindowTitle(tr('add')); mb.setText(tr('add'))
+        files_btn = mb.addButton('Select files (images/pdf/archives)', QMessageBox.ActionRole); folder_btn = mb.addButton('Add folder', QMessageBox.ActionRole); mb.addButton(tr('cancel'), QMessageBox.RejectRole)
+        mb.exec(); clicked = mb.clickedButton()
+        if clicked == files_btn:
+            files,_ = QFileDialog.getOpenFileNames(self,'Select files','', 'Supported (*.zip *.cbz *.cbr *.rar *.pdf *.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)')
+            for f in files:
+                if not f: continue; s = make_source(f); self.sources.append(s)
+            self.apply_sort(); self._refresh_list(); session_save_sources(self.sources)
+        elif clicked == folder_btn:
+            folder = QFileDialog.getExistingDirectory(self,'Select folder');
+            if not folder: return; added = self._scan_and_add_folder(folder)
+            if not added: QMessageBox.information(self,'', tr('no_sources_msg'))
+            self.apply_sort(); self._refresh_list(); session_save_sources(self.sources)
 
-    def clear_all(self):
-        self.sources.clear(); self._refresh_list(); self._save_session()
+    def _scan_and_add_folder(self, folder_path: str) -> bool:
+        found=[]; folder_path=os.path.abspath(folder_path)
+        for root,dirs,files in os.walk(folder_path):
+            for d in dirs:
+                sub=os.path.join(root,d)
+                has_pr=False; has_im=False
+                for r2,d2,f2 in os.walk(sub):
+                    for ff in f2:
+                        ext=os.path.splitext(ff)[1].lower()
+                        if ext in PRIORITY_EXTS: has_pr=True; break
+                        if ext in IMAGE_EXTS: has_im=True
+                    if has_pr: break
+                if has_pr: found.append(sub)
+        top_pr=False; top_im=False
+        for f in os.listdir(folder_path):
+            ext=os.path.splitext(f)[1].lower();
+            if ext in PRIORITY_EXTS: top_pr=True
+            if ext in IMAGE_EXTS: top_im=True
+        if found:
+            for sub in sorted(set(found), key=natural_sort_key): self.sources.append(make_source(sub))
+            return True
+        if top_pr or top_im:
+            self.sources.append(make_source(folder_path)); return True
+        return False
+
+    def action_delete(self):
+        sel=sorted({idx.row() for idx in self.list_widget.selectedIndexes()}, reverse=True)
+        for r in sel:
+            if 0<=r<len(self.sources): s=self.sources.pop(r);
+            if s.get('temp'):
+                try: shutil.rmtree(s['temp'], ignore_errors=True)
+                except: pass
+        self._refresh_list(); session_save_sources(self.sources)
+
+    def action_clear(self):
+        for s in self.sources:
+            if s.get('temp'):
+                try: shutil.rmtree(s['temp'], ignore_errors=True)
+                except: pass
+        self.sources.clear(); self._refresh_list(); session_save_sources(self.sources)
+
+    def action_edit_contents(self, item):
+        row=self.list_widget.currentRow();
+        if row<0 or row>=len(self.sources): return
+        src=self.sources[row]; dlg=ContentsEditor(self, src)
+        if dlg.exec(): self.apply_sort(); self._refresh_list(); session_save_sources(self.sources)
+
+    def action_convert(self):
+        if not self.sources: QMessageBox.warning(self,'', tr('no_sources_msg')); return
+        mb=QMessageBox(self); mb.setWindowTitle(tr('settings')); mb.setText(tr('settings'))
+        sep=mb.addButton(tr('separate'), QMessageBox.ActionRole); merg=mb.addButton(tr('merge'), QMessageBox.ActionRole); mb.addButton(tr('cancel'), QMessageBox.RejectRole); mb.exec()
+        if mb.clickedButton() is None: return
+        do_merge=(mb.clickedButton()==merg)
+        mb2=QMessageBox(self); mb2.setWindowTitle(tr('output_format')); mb2.setText(tr('output_format'))
+        pdf_b=mb2.addButton(tr('pdf'), QMessageBox.ActionRole); cbz_b=mb2.addButton(tr('cbz'), QMessageBox.ActionRole); mb2.addButton(tr('cancel'), QMessageBox.RejectRole); mb2.exec()
+        if mb2.clickedButton() is None: return
+        out_fmt = 'PDF' if mb2.clickedButton()==pdf_b else 'CBZ'
+        final_name=None
+        if do_merge:
+            base=remove_numbers_from_name(os.path.basename(self.sources[0]['path'])) or 'output'
+            text, ok = QInputDialog.getText(self, tr('merged_filename'), tr('proposed_filename'), text=base+'_merged')
+            if not ok: return
+            final_name=text.strip();
+            if final_name=='': QMessageBox.warning(self,'Invalid', tr('invalid_name')); return
+        out_dir = QFileDialog.getExistingDirectory(self, tr('choose_output_folder'))
+        if not out_dir: return
+        run_cfg = {
+            'quality': self.quality_spin.value(), 'use_custom_dpi': self.custom_dpi_cb.isChecked(), 'dpi': self.dpi_spin.value(),
+            'enhancement': {'brightness': self.enh_b_slider.value()/10.0, 'contrast': self.enh_c_slider.value()/10.0, 'sharpness': self.enh_s_slider.value()/10.0, 'resize_w': self.resize_spin.value()},
+            'grayscale': self.gray_cb.isChecked()
+        }
+        CONFIG.update(run_cfg)
+        self.progress.setVisible(True); self.progress.setValue(0); self.cancel_btn.setEnabled(True)
+        thread_sources=[s.copy() for s in self.sources]
+        worker=BatchWorker(thread_sources, out_dir, merge=do_merge, out_format=out_fmt, quality=run_cfg['quality'], dpi=run_cfg['dpi'])
+        self.worker=worker
+        worker.progress.connect(self.progress.setValue); worker.message.connect(self._log); worker.detailed.connect(self._on_detailed); worker.finished.connect(self._on_finished)
+        worker.start()
+
+    def action_cancel(self):
+        if self.worker: self.worker.cancel(); self._log('Cancel requested...'); self.cancel_btn.setEnabled(False)
+
+    def _on_detailed(self, info: dict):
+        si = info.get('source_index'); st = info.get('source_total'); p = info.get('page'); pt = info.get('page_total')
+        self._log(f"{si}/{st} — {p}/{pt}")
+
+    def _on_finished(self, outputs: List[str]):
+        self.progress.setVisible(False); self.cancel_btn.setEnabled(False)
+        if not outputs: QMessageBox.information(self, tr('done'), tr('no_outputs')); return
+        msg = tr('created') + '\n' + '\n'.join(outputs)
+        dlg = QMessageBox(self); dlg.setWindowTitle(tr('done')); dlg.setText(msg)
+        open_f = dlg.addButton(tr('open_folder'), QMessageBox.ActionRole); open_file = dlg.addButton(tr('open_file'), QMessageBox.ActionRole)
+        dlg.addButton(tr('cancel'), QMessageBox.RejectRole); dlg.exec()
+        if dlg.clickedButton() == open_f:
+            try:
+                if sys.platform.startswith('win'): os.startfile(os.path.dirname(outputs[0]))
+                elif sys.platform == 'darwin': subprocess.call(['open', os.path.dirname(outputs[0])])
+                else: subprocess.call(['xdg-open', os.path.dirname(outputs[0])])
+            except Exception:
+                pass
+        elif dlg.clickedButton() == open_file:
+            try:
+                f = outputs[0]
+                if sys.platform.startswith('win'): os.startfile(f)
+                elif sys.platform == 'darwin': subprocess.call(['open', f])
+                else: subprocess.call(['xdg-open', f])
+            except Exception:
+                pass
+        session_save_sources(self.sources)
+
+    def _log(self, txt: str):
+        self.log_list.addItem(txt); self.log_list.scrollToBottom()
 
     def _refresh_list(self):
         self.list_widget.clear()
-        for idx, s in enumerate(self.sources):
+        for i, s in enumerate(self.sources, start=1):
             icon = '📁' if s['type']=='folder' else ('📦' if s['type']=='archive' else ('🖼️' if s['type']=='image' else '📄'))
-            self.list_widget.addItem(f"{idx+1}. {icon} {s['label']}")
+            self.list_widget.addItem(f"{i}. {icon} {s.get('label', os.path.basename(s.get('path','')))}")
 
-    def _on_select(self):
-        sel = self.list_widget.currentRow()
-        if sel < 0 or sel >= len(self.sources): return
-        s = self.sources[sel]
-        # preview first image or PDF cover
-        preview_path = None
-        if s['type'] == 'image': preview_path = s['path']
-        elif s['type'] == 'pdf' and HAS_FITZ:
-            try:
-                doc = fitz.open(s['path'])
-                pix = doc.load_page(0).get_pixmap()
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
-                pix.save(tmp.name); tmp.close()
-                preview_path = tmp.name
-                doc.close()
-            except Exception:
-                preview_path = None
-        elif s['type'] in ('archive','folder'):
-            # show folder icon
-            preview_path = None
+    def on_sort_changed(self, _): self.apply_sort(); self._refresh_list(); CONFIG['sort_mode']=self.sort_combo.currentText(); save_json(CONFIG_PATH, CONFIG)
 
-        if preview_path and os.path.exists(preview_path):
-            pix = QPixmap(preview_path)
-            pix = pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.preview_label.setPixmap(pix)
-            # cleanup if was temp
-            if preview_path.startswith(tempfile.gettempdir()):
-                try: os.remove(preview_path)
+    def apply_sort(self):
+        mode=self.sort_combo.currentText()
+        if mode=='Manual': return
+        if mode=='Name (natural)': self.sources.sort(key=lambda s: natural_sort_key(s.get('label','')))
+        elif mode=='Added time': self.sources.sort(key=lambda s: s.get('added_at') or 0)
+        elif mode=='Number':
+            def k(s): n=extract_last_number(s.get('label','')); return (n if n is not None else 10**9, natural_sort_key(s.get('label','')))
+            self.sources.sort(key=k)
+
+    def save_settings(self):
+        CONFIG['quality']=self.quality_spin.value(); CONFIG['use_custom_dpi']=self.custom_dpi_cb.isChecked(); CONFIG['dpi']=self.dpi_spin.value()
+        CONFIG['enhancement']={'brightness':self.enh_b_slider.value()/10.0,'contrast':self.enh_c_slider.value()/10.0,'sharpness':self.enh_s_slider.value()/10.0,'resize_w':self.resize_spin.value()}
+        CONFIG['grayscale']=self.gray_cb.isChecked(); save_json(CONFIG_PATH, CONFIG); QMessageBox.information(self,'Settings','Saved')
+
+    def closeEvent(self, ev):
+        CONFIG['sort_mode']=self.sort_combo.currentText(); save_json(CONFIG_PATH, CONFIG); session_save_sources(self.sources)
+        for s in self.sources:
+            if s.get('temp'):
+                try: shutil.rmtree(s['temp'], ignore_errors=True)
                 except: pass
-        else:
-            self.preview_label.setText('No preview available')
+        try: compileall.compile_file(__file__, force=False, quiet=1)
+        except Exception: pass
+        ev.accept()
 
-    # --- Processing ---
-    def start_processing(self):
-        if not self.sources:
-            QMessageBox.warning(self, '!', 'No sources added')
-            return
-        is_merge = (self.combo_mode.currentIndex() == 1)
-        fmt = self.combo_fmt.currentText()
-        final_name = 'Output'
-        if is_merge:
-            txt, ok = QInputDialog.getText(self, 'Output Name', 'Enter output filename:')
-            if ok and txt.strip(): final_name = txt.strip()
-            else: return
-        out_dir = QFileDialog.getExistingDirectory(self, 'Select Output Folder')
-        if not out_dir: return
-
-        # build runtime config
-        run_conf = {
-            'quality': self.spin_qual.value(),
-            'grayscale': self.chk_gray.isChecked(),
-            'enhancement': {
-                'brightness': self.sl_bright.value()/10.0,
-                'contrast': self.sl_contrast.value()/10.0,
-                'sharpness': self.sl_sharp.value()/10.0,
-                'resize_w': self.spin_resize.value()
-            },
-            'use_custom_dpi': self.chk_custom_dpi.isChecked(),
-            'dpi': self.spin_dpi.value()
-        }
-
-        # disable UI
-        self.btn_start.setEnabled(False); self.progress.setVisible(True); self.progress.setValue(0); self.log_list.clear()
-        self.btn_cancel.setEnabled(True)
-
-        self.worker = SuperWorker(self.sources, out_dir, is_merge, fmt, final_name, run_conf)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.log.connect(self._log)
-        self.worker.finished.connect(self._finished)
-        self.worker.start()
-
-    def _log(self, msg):
-        self.log_list.addItem(msg); self.log_list.scrollToBottom()
-
-    def _finished(self, outputs):
-        self.btn_start.setEnabled(True); self.progress.setVisible(False); self.btn_cancel.setEnabled(False)
-        if outputs:
-            QMessageBox.information(self, APP_NAME, f"Done. Generated {len(outputs)} file(s)")
-            for o in outputs: self._log(f"Output: {o}")
-        else:
-            QMessageBox.information(self, APP_NAME, 'No outputs (maybe cancelled)')
-        self._log('--- END ---')
-
-    def _cancel(self):
-        try:
-            if hasattr(self, 'worker'):
-                self.worker.stop(); self._log('Cancel requested...')
-                self.btn_cancel.setEnabled(False)
-        except Exception:
-            pass
-
-    # --- Settings persistence ---
-    def _save_settings(self):
-        cconf['quality'] = self.spin_qual.value()
-        cconf['grayscale'] = self.chk_gray.isChecked()
-        cconf['enhancement']['brightness'] = self.sl_bright.value()/10.0
-        cconf['enhancement']['contrast'] = self.sl_contrast.value()/10.0
-        cconf['enhancement']['sharpness'] = self.sl_sharp.value()/10.0
-        cconf['enhancement']['resize_w'] = self.spin_resize.value()
-        cconf['use_custom_dpi'] = self.chk_custom_dpi.isChecked()
-        cconf['dpi'] = self.spin_dpi.value()
-        save_config()
-        QMessageBox.information(self, 'Settings', 'Settings saved')
-
-    # --- Session load/save ---
-    def _save_session(self):
-        try:
-            with open(SESSION_PATH, 'w', encoding='utf-8') as f:
-                json.dump({'sources': self.sources}, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def _load_session(self):
-        if SESSION_PATH.exists():
-            try:
-                with open(SESSION_PATH, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.sources = data.get('sources', [])
-            except Exception:
-                pass
-
-    def closeEvent(self, e):
-        self._save_settings(); self._save_session(); e.accept()
-
-    # Drag & drop
-    def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls(): e.accept()
-    def dropEvent(self, e):
-        for u in e.mimeData().urls(): self._add_src(u.toLocalFile())
-        self._refresh_list(); self._save_session()
-
+# ---------------- run ----------------
+def main():
+    app = QApplication(sys.argv); w = MainWindow(); w.show(); sys.exit(app.exec())
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    app.setFont(QFont('Segoe UI', 10))
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec())
+    main()
