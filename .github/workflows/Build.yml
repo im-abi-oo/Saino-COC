@@ -1,72 +1,104 @@
-name: Build Saino COC
+name: Build Saino COC (Nuitka) - main.py (Windows)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.11'
+  MAIN_SCRIPT: 'main.py'
+  DIST_DIR: 'dist'
+  PIP_CACHE_DIR: '.gha-cache/pip'
+  NUITKA_CACHE_DIR: '.gha-cache/nuitka'
+  OUTPUT_EXE_NAME: 'Saino COC.exe'
+  ICON_PATH: ''  # اگر آیکون داری اینجا مسیر بذار
 
 jobs:
   build-nuitka:
     runs-on: windows-latest
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x'
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies for Nuitka
+      - name: Ensure cache dirs exist
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          pip install nuitka PySide6 Pillow PyMuPDF img2pdf pypdf patool zstandard
+          New-Item -ItemType Directory -Path "${{ env.PIP_CACHE_DIR }}" -Force | Out-Null
+          New-Item -ItemType Directory -Path "${{ env.NUITKA_CACHE_DIR }}" -Force | Out-Null
+          Write-Host "PIP cache: $env:PIP_CACHE_DIR"
+          Write-Host "Nuitka cache: $env:NUITKA_CACHE_DIR"
 
-      - name: Build executable with Nuitka
-        run: |
-          python -m nuitka `
-            --standalone `
-            --onefile `
-            --assume-yes-for-downloads `
-            --enable-plugin=pyside6 `
-            --disable-console `
-            --output-dir=dist `
-            --output-file="Saino COC.exe" `
-            main.py
-
-      - name: Upload Nuitka executable
-        uses: actions/upload-artifact@v3
+      - name: Cache pip wheels
+        uses: actions/cache@v4
         with:
-          name: Saino-COC-Nuitka
-          path: dist/*.exe
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/main.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-  build-briefcase:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Cache Nuitka object cache
+        uses: actions/cache@v4
         with:
-          python-version: '3.x'
+          path: ${{ env.NUITKA_CACHE_DIR }}
+          key: ${{ runner.os }}-nuitka-${{ hashFiles('**/main.py') }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-
 
-      - name: Install WiX Toolset
-        run: choco install wixtoolset -y
-
-      - name: Install dependencies for Briefcase
+      - name: Ensure native toolchain & 7zip
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          pip install briefcase PySide6 Pillow PyMuPDF img2pdf pypdf patool
+          Write-Host "Checking for MSVC (cl.exe)..."
+          if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
+            Write-Host "MSVC found."
+          } else {
+            Write-Warning "MSVC not found. Attempting MinGW via choco if available."
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              choco install -y mingw --no-progress || Write-Warning "choco mingw attempted"
+            } else {
+              Write-Warning "choco not available; relying on runner toolchain (windows-latest normally has MSVC)."
+            }
+          }
+          if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              choco install -y 7zip.install --no-progress || Write-Warning "choco 7zip attempted"
+            } else {
+              Write-Warning "7zip not available and choco not present."
+            }
+          } else {
+            Write-Host "7z found."
+          }
 
-      - name: Build with BeeWare Briefcase
+      - name: Install runtime Python packages
+        shell: pwsh
         run: |
-          briefcase create windows
-          briefcase build windows
-          briefcase package windows
+          python -m pip install --upgrade pip setuptools wheel
+          # نصب بسته‌های که main.py به احتمال زیاد نیاز داره؛ اگر بسته‌ای اضافه‌ست خودت اضافه کن
+          python -m pip install --upgrade PySide6 Pillow img2pdf pypdf PyPDF2 patool PyMuPDF zstandard --cache-dir "${{ env.PIP_CACHE_DIR }}"
+          if ($LASTEXITCODE -ne 0) { Write-Error "pip install runtime packages failed (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
 
-      - name: Upload Briefcase artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: Saino-COC-Briefcase
-          path: windows/**
+      - name: Show installed packages & versions
+        shell: pwsh
+        run: |
+          python -V
+          pip list
+          # check PySide6 import (immediate feedback)
+          python - <<'PY'
+import sys
+try:
+    import PySide6
+    print("PySide6 version:", PySide6.__version__)
+except Exception as e:
+    print("PySide6 import FAILED:", e)
+    sys.exit(2)
+PY
+
+      - name: Install Nuitka
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade nuitka --cache-dir "${{ env.PIP_CACHE_DIR }}"
