@@ -1,153 +1,72 @@
-name: Build Saino COC (Nuitka, debug-friendly)
+name: Build Saino COC
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   workflow_dispatch:
 
-env:
-  PYTHON_VERSION: '3.11'
-  MAIN_SCRIPT: 'main.py'
-  DIST_DIR: 'dist'
-  PIP_CACHE_DIR: '.gha-cache/pip'
-  NUITKA_CACHE_DIR: '.gha-cache/nuitka'
-  OUTPUT_EXE_NAME: 'Saino COC.exe'
-  ICON_PATH: ''
-
 jobs:
-  build-windows:
+  build-nuitka:
     runs-on: windows-latest
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.x'
 
-      - name: Ensure cache dirs
-        shell: pwsh
+      - name: Install dependencies for Nuitka
         run: |
-          New-Item -ItemType Directory -Path "${{ env.PIP_CACHE_DIR }}" -Force | Out-Null
-          New-Item -ItemType Directory -Path "${{ env.NUITKA_CACHE_DIR }}" -Force | Out-Null
+          python -m pip install --upgrade pip
+          pip install nuitka PySide6 Pillow PyMuPDF img2pdf pypdf patool zstandard
 
-      - name: Install runtime packages (direct pip install)
-        shell: pwsh
+      - name: Build executable with Nuitka
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          # install packages that main.py may need; add/remove if your code uses others
-          python -m pip install --upgrade PySide6 Pillow img2pdf pypdf PyPDF2 patool PyMuPDF --cache-dir "${{ env.PIP_CACHE_DIR }}"
-          if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+          python -m nuitka `
+            --standalone `
+            --onefile `
+            --assume-yes-for-downloads `
+            --enable-plugin=pyside6 `
+            --disable-console `
+            --output-dir=dist `
+            --output-file="Saino COC.exe" `
+            main.py
 
-      - name: Show installed packages & PySide6 version
-        shell: pwsh
-        run: |
-          python -V
-          pip list
-          try {
-            python -c "import PySide6, sys; print('PySide6', PySide6.__version__)"
-          } catch {
-            Write-Warning "PySide6 import failed - check installation"
-            python -c "import traceback, sys; traceback.print_exc()"
-            exit 1
-          }
-
-      - name: Install Nuitka
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade nuitka --cache-dir "${{ env.PIP_CACHE_DIR }}"
-          if ($LASTEXITCODE -ne 0) { Write-Error "Failed to install nuitka"; exit $LASTEXITCODE }
-
-      - name: Ensure native toolchain & 7zip
-        shell: pwsh
-        run: |
-          if (Get-Command cl.exe -ErrorAction SilentlyContinue) { Write-Host "MSVC found." } else { Write-Warning "MSVC not found on PATH." }
-          if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) { Write-Warning "7z not found." } else { Write-Host "7z found." }
-
-      - name: Verify main.py exists
-        shell: pwsh
-        run: |
-          if (-not (Test-Path $env:MAIN_SCRIPT)) { Write-Error "File $env:MAIN_SCRIPT not found in repo root."; exit 1 } else { Write-Host "Found $env:MAIN_SCRIPT" }
-
-      - name: Build with Nuitka (standalone, verbose — debug friendly)
-        shell: pwsh
-        env:
-          NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_DIR }}
-        run: |
-          $script = $env:MAIN_SCRIPT
-          $outdir = Join-Path $PWD $env:DIST_DIR
-          if (Test-Path $outdir) { Remove-Item -Recurse -Force $outdir }
-          New-Item -ItemType Directory -Path $outdir | Out-Null
-
-          $args = @(
-            "--standalone",
-            "--remove-output",
-            "--output-dir=" + $outdir,
-            "--enable-plugin=pyside6",
-            "--include-qt-plugins=platforms,styles",
-            "--follow-imports",
-            "--verbose",
-            "--jobs=2"
-          )
-          # For debugging keep folder mode (no --onefile). If this passes, we can add --onefile later.
-          $cmd = "python -m nuitka " + ($args -join " ") + " " + $script
-          Write-Host "Running Nuitka:"
-          Write-Host $cmd
-          iex $cmd
-          $code = $LASTEXITCODE
-          Write-Host "Nuitka exit code: $code"
-          if ($code -ne 0) {
-            Write-Error "Nuitka build failed with exit code $code. Showing dist folder and recent logs to help debugging."
-            # show dist contents (if any)
-            if (Test-Path $outdir) {
-              Write-Host "=== dist tree ==="
-              Get-ChildItem -Recurse -Force $outdir | Select-Object FullName,Length | Format-Table -AutoSize
-            } else {
-              Write-Host "dist directory not created."
-            }
-            # try to find any nuitka-log files
-            $logs = Get-ChildItem -Path . -Filter "*nuitka*" -Recurse -ErrorAction SilentlyContinue
-            if ($logs) {
-              Write-Host "=== Found potential log files: ==="
-              $logs | ForEach-Object { Write-Host $_.FullName; Get-Content -Path $_.FullName -TotalCount 200 }
-            }
-            exit $code
-          } else {
-            Write-Host "Nuitka build succeeded (standalone)."
-          }
-
-      - name: (Optional) Copy exe to final name if onefile created
-        shell: pwsh
-        run: |
-          $dist = Join-Path $PWD $env:DIST_DIR
-          # find exe inside dist folder (standalone mode creates a folder with an exe inside)
-          $exe = Get-ChildItem -Path $dist -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($exe) {
-            $dest = Join-Path $dist $env:OUTPUT_EXE_NAME
-            Copy-Item $exe.FullName $dest -Force
-            Write-Host "Copied $($exe.FullName) -> $dest"
-          } else {
-            Write-Warning "No exe found to rename (standalone build may have created a folder)."
-          }
-
-      - name: Zip dist and upload artifact
-        shell: pwsh
-        run: |
-          $dist = Join-Path $PWD $env:DIST_DIR
-          $zip = Join-Path $PWD "Saino_COC_dist.zip"
-          if (Test-Path $zip) { Remove-Item $zip -Force }
-          if (Test-Path $dist) {
-            Compress-Archive -Path "$dist\*" -DestinationPath $zip
-            Write-Host "Created $zip"
-          } else {
-            Write-Warning "Dist folder missing; nothing to zip."
-          }
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload Nuitka executable
+        uses: actions/upload-artifact@v3
         with:
-          name: Saino-COC-release
-          path: |
-            ${{ env.DIST_DIR }}
-            Saino_COC_dist.zip
+          name: Saino-COC-Nuitka
+          path: dist/*.exe
+
+  build-briefcase:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install WiX Toolset
+        run: choco install wixtoolset -y
+
+      - name: Install dependencies for Briefcase
+        run: |
+          python -m pip install --upgrade pip
+          pip install briefcase PySide6 Pillow PyMuPDF img2pdf pypdf patool
+
+      - name: Build with BeeWare Briefcase
+        run: |
+          briefcase create windows
+          briefcase build windows
+          briefcase package windows
+
+      - name: Upload Briefcase artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: Saino-COC-Briefcase
+          path: windows/**
