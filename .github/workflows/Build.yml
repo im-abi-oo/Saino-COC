@@ -1,17 +1,20 @@
-name: Build Saino COC (Windows, Nuitka)
+name: Build Saino COC (Windows, Nuitka) - main.py
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
 
+# متغیرهای عمومی
 env:
   PYTHON_VERSION: '3.11'
   MAIN_SCRIPT: 'main.py'
   OUTPUT_EXE_NAME: 'Saino COC.exe'
   DIST_DIR: 'dist'
-  PIP_CACHE_DIR: ${{ runner.temp }}\pip-cache
-  NUITKA_CACHE_DIR: ${{ runner.temp }}\nuitka-cache
+  # مسیرهای کش داخل workspace (قابل استفاده در actions/cache)
+  PIP_CACHE_PATH: '.gha-cache/pip'
+  NUITKA_CACHE_PATH: '.gha-cache/nuitka'
+  ICON_PATH: '' # در صورت داشتن آیکون مسیرش را اینجا قرار بده (مثلاً 'resources/icon.ico')
 
 jobs:
   build-windows-exe:
@@ -20,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -29,11 +32,18 @@ jobs:
         run: |
           python -V
           echo "Main script: $MAIN_SCRIPT"
-          echo "Nuitka cache: $NUITKA_CACHE_DIR"
+          echo "PIP cache path: $PIP_CACHE_PATH"
+          echo "Nuitka cache path: $NUITKA_CACHE_PATH"
+        shell: bash
 
-      # ------------------ generate requirements (best-effort) ------------------
-      - name: Generate requirements.txt from imports (auto-detect)
-        shell: powershell
+      - name: Ensure cache folders exist
+        run: |
+          mkdir -p "${{ env.PIP_CACHE_PATH }}"
+          mkdir -p "${{ env.NUITKA_CACHE_PATH }}"
+        shell: bash
+
+      - name: Generate requirements.txt from imports (best-effort)
+        shell: pwsh
         run: |
           python - <<'PY'
           import re,sys,os
@@ -53,9 +63,7 @@ jobs:
             "numpy":"numpy",
             "cv2":"opencv-python",
             "easyocr":"easyocr",
-            "deep_translator":"deep-translator",
-            "compileall":"",
-            "json":"","os":"","sys":"","re":"","shutil":"","tempfile":"","zipfile":"","subprocess":"","time":"","pathlib":"","typing":""
+            "deep_translator":"deep-translator"
           }
           found=set()
           try:
@@ -75,104 +83,80 @@ jobs:
           # ensure build-time tools present
           found.add("nuitka")
           found.add("wheel")
-          # optional quality helpers
-          found_list=sorted(found)
           with open('requirements.txt','w',encoding='utf-8') as f:
-            for p in found_list:
+            for p in sorted(found):
               f.write(p + "\n")
-          print("Wrote requirements.txt with:", found_list)
+          print("Wrote requirements.txt with:", sorted(found))
           PY
 
-      - name: Display generated requirements
-        run: type requirements.txt
+      - name: Show generated requirements
         shell: cmd
+        run: type requirements.txt
 
-      # ------------------ caches ------------------
-      - name: Cache pip cache
+      - name: Cache pip packages
         uses: actions/cache@v4
         with:
-          path: ${{ env.PIP_CACHE_DIR }}
+          path: ${{ env.PIP_CACHE_PATH }}
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Cache Nuitka cache
+      - name: Cache Nuitka object cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.NUITKA_CACHE_DIR }}
+          path: ${{ env.NUITKA_CACHE_PATH }}
           key: ${{ runner.os }}-nuitka-${{ hashFiles('**/main.py','requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-nuitka-
 
-      # ------------------ ensure native toolchain (auto) ------------------
-      - name: Ensure native build tools (MSVC or MinGW) and 7zip
-        shell: powershell
+      - name: Ensure native build tools & 7zip (MSVC or MinGW via choco)
+        shell: pwsh
         run: |
-          Write-Host "Checking for MSVC (cl.exe)..."
+          Write-Host "Checking for cl.exe (MSVC)..."
           if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
             Write-Host "MSVC (cl.exe) found in PATH. Using MSVC."
           } else {
-            Write-Host "MSVC not found. Will try to ensure MinGW via choco (Nuitka can use MinGW)."
+            Write-Host "MSVC not found. Attempting to install MinGW via chocolatey (if available)."
             if (Get-Command choco -ErrorAction SilentlyContinue) {
               choco install -y mingw --no-progress || choco install -y mingw --no-progress
-              # try to guess mingw bin dir
-              $candidates = @("C:\tools\mingw64\bin","C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin")
-              $added = $false
-              foreach ($p in $candidates) {
-                if (Test-Path $p) {
-                  Write-Host "Adding $p to PATH"
-                  $env:PATH = "$p;$env:PATH"
-                  $added = $true
-                  break
-                }
-              }
-              # fallback: look for gcc exe on system
-              $gcc = Get-Command gcc -ErrorAction SilentlyContinue
-              if ($gcc) {
-                Write-Host "Found gcc at $($gcc.Path), ensuring PATH contains it."
-              } elseif (-not $added) {
-                Write-Warning "MinGW install attempt did not find expected bin dir. Nuitka may still auto-download a compiler or fail."
-              }
+              Write-Host "Attempted MinGW install. If compiler not found Nuitka may still try to download or fail."
             } else {
-              Write-Warning "choco not available on runner, cannot auto-install MinGW. Relying on runner-provided toolchain."
+              Write-Warning "choco not available: relying on runner toolchain. windows-latest normally has MSVC."
             }
           }
-          Write-Host "Ensuring 7zip is available (for archive extraction)."
+          Write-Host "Ensuring 7zip (7z.exe) is available..."
           if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
             if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install -y 7zip.install --no-progress || echo "7zip install failed"
+              choco install -y 7zip.install --no-progress || Write-Warning "7zip install failed"
             } else {
-              Write-Warning "choco not available, 7zip not installed. If extraction fails, consider adding 7zip to runner."
+              Write-Warning "7zip not installed and choco unavailable."
             }
           } else {
             Write-Host "7z found."
           }
 
-      # ------------------ install python deps ------------------
-      - name: Install Python dependencies
+      - name: Install Python dependencies (pip) using cache dir
         shell: cmd
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -r requirements.txt --cache-dir "%PIP_CACHE_DIR%"
+          python -m pip install -r requirements.txt --cache-dir "%CD%\${{ env.PIP_CACHE_PATH }}"
 
-      - name: Install/upgrade Nuitka
+      - name: Install/upgrade Nuitka and plugins
         shell: cmd
         run: |
-          python -m pip install --upgrade nuitka --cache-dir "%PIP_CACHE_DIR%"
-          python -m pip install --upgrade nuitka-plugins --cache-dir "%PIP_CACHE_DIR%" || echo "nuitka-plugins optional"
+          python -m pip install --upgrade nuitka --cache-dir "%CD%\${{ env.PIP_CACHE_PATH }}"
+          python -m pip install --upgrade nuitka-plugins --cache-dir "%CD%\${{ env.PIP_CACHE_PATH }}" || echo "nuitka-plugins optional"
 
-      # ------------------ prepare dist dir ------------------
       - name: Prepare dist dir
         shell: cmd
         run: |
           if exist %DIST_DIR% rmdir /s /q %DIST_DIR%
           mkdir %DIST_DIR%
 
-      # ------------------ build with Nuitka ------------------
-      - name: Build with Nuitka (onefile, pyside6 plugin, using NUITKA_CACHE_DIR)
-        shell: powershell
+      - name: Build with Nuitka (onefile, pyside6 plugin)
+        shell: pwsh
         env:
-          NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_DIR }}
+          NUITKA_CACHE_DIR: ${{ env.NUITKA_CACHE_PATH }}
         run: |
           $script = "${{ env.MAIN_SCRIPT }}"
           $outdir = Join-Path $PWD "${{ env.DIST_DIR }}"
@@ -185,17 +169,18 @@ jobs:
             "--include-qt-plugins=platforms,styles",
             "--follow-imports"
           )
-          # optionally enable more plugins if found in requirements
-          # jobs: let Nuitka use parallelism (adjust number if runner has more cores)
+          # add icon if provided
+          if ("${{ env.ICON_PATH }}" -ne "") {
+            $args += "--windows-icon-from-ico=${{ env.ICON_PATH }}"
+          }
+          # allow some parallelism
           $args += "--jobs=2"
-          # set base cache dir via env above; Nuitka will honor NUITKA_CACHE_DIR
           $cmd = "python -m nuitka " + ($args -join " ") + " " + $script
           Write-Host "Running: $cmd"
           iex $cmd
 
-      # ------------------ locate & rename exe ------------------
       - name: Locate and rename EXE to final name
-        shell: powershell
+        shell: pwsh
         run: |
           $dist = Join-Path $PWD "${{ env.DIST_DIR }}"
           $exe = Get-ChildItem -Path $dist -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -208,7 +193,7 @@ jobs:
           Write-Host "Copied $($exe.FullName) -> $dest"
 
       - name: Zip dist for artifact
-        shell: powershell
+        shell: pwsh
         run: |
           $dist = Join-Path $PWD "${{ env.DIST_DIR }}"
           $zip = Join-Path $PWD "Saino_COC_dist.zip"
