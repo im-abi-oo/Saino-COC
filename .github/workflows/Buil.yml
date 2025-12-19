@@ -30,7 +30,7 @@ jobs:
       - name: Build with Nuitka (onefile)
         shell: powershell
         run: |
-           python -m nuitka --onefile --standalone --follow-imports --enable-plugin=pyside6 --include-qt-plugins=platforms,styles --remove-output --output-dir=${{ env.DIST_DIR }} ${{ env.MAIN_SCRIPT }} --assume-yes-for-downloads
+           python -m nuitka --standalone --follow-imports --enable-plugin=pyside6 --include-qt-plugins=platforms,styles --windows-console-mode=disable --remove-output --output-dir=${{ env.DIST_DIR }} ${{ env.MAIN_SCRIPT }} --assume-yes-for-downloads
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
