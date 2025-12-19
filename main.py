@@ -1,29 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Saino COC — Final
-Features in this final build:
-- Tree view (QTreeWidget): top-level nodes = groups (ZIP or folder), children = images. Clear which image belongs to which ZIP.
-- Natural numeric sorting for ZIPs and images inside them.
-- Ability to reorder groups (select group root + Move Up/Move Down) and reorder images within a group (select child + Move Up/Move Down).
-- Supports multi-ZIP selection; ZIPs are sorted numerically before extracting.
-- On Convert: if multiple ZIP groups detected, a bilingual dialog asks whether to create separate PDFs per group or combine into a single PDF. Buttons and dialogs are fully bilingual (EN/FA). Toggle language with Ctrl+L.
-- Conversion runs in a background QThread to avoid UI freeze.
-- Memory optimization: scaled JPEGs are written to temp, then assembled into PDFs; temp cleaned up and GC run.
-- Estimated final size shown before conversion.
-
-Usage:
-- Load Folder: adds a group (folder name) with its images (numeric-sorted).
-- Load ZIP(s): select multiple ZIP files; they will be natural-sorted (CH1, CH2, CH10) and each becomes a group.
-- Drag & drop ZIP(s) or folders or individual images — multiple ZIPs dropped together are sorted automatically.
-- Select a group (click group name) to move the whole group up/down using the same Move Up/Move Down buttons. Select an image (child) to move it within its group.
-- Double-click an image to preview it.
-- Press Ctrl+L to toggle English / Persian UI.
-
-Save as: saino_coc_final.py
-Requires: PySide6, Pillow
-"""
-
 import sys
 import os
 import zipfile
@@ -31,22 +5,25 @@ import tempfile
 import shutil
 import subprocess
 import gc
-from datetime import datetime
+import compileall
+import time
 import re
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QFileDialog,
     QTreeWidget, QTreeWidgetItem, QLabel, QMessageBox, QHBoxLayout,
-    QAbstractItemView, QSpinBox, QFormLayout, QGroupBox, QProgressBar
+    QAbstractItemView, QSpinBox, QFormLayout, QProgressBar,
+    QSizePolicy, QComboBox, QFrame
 )
-# QShortcut location differs across PySide6 versions
 try:
     from PySide6.QtWidgets import QShortcut
 except Exception:
     from PySide6.QtGui import QShortcut
 
-from PySide6.QtGui import QPixmap, QImage, QDragEnterEvent, QDropEvent, QKeySequence
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QPixmap, QImage, QDragEnterEvent, QDropEvent, QKeySequence, QFont
+from PySide6.QtCore import Qt, QThread, Signal, QEvent, QTimer
 from PIL import Image
 
 # ---------------- i18n ----------------
@@ -64,7 +41,8 @@ STRINGS = {
         'convert': "📄 Convert to PDF",
         'clear': "🧹 Clear List",
         'remove': "✖ Remove Selected",
-        'image_scale': "Image Scale:",
+        'res_scale': "Resolution Scale (%):",
+        'jpeg_quality': "JPEG Quality (%):",
         'no_images': "No images selected.",
         'zip_error': "Failed to open ZIP:",
         'created': "PDF created:",
@@ -77,11 +55,16 @@ STRINGS = {
         'no_valid': "No valid images found to convert.",
         'processing': "Processing images...",
         'separate_or_combine': "Multiple groups detected. Create separate PDFs per group?",
-        'yes': "Yes",
-        'no': "No",
-        'estimate_title': "Estimated size",
-        'estimate_proceed': "Estimated total: {size}\nProceed?",
-        'combined_name_info': "Combined filename will be: {name}.pdf",
+        'yes': "Separate",
+        'no': "Combine into one",
+        'dropped_images': "Dropped Images",
+        'lang_toggle': "FA/EN",
+        'sort_label': "Sort:",
+        'sort_default': "Default",
+        'sort_name': "By Name",
+        'sort_number': "By Number",
+        'tool_window_hint': "Mini mode",
+        'optimize_pyc': "Optimize .pyc"
     },
     'fa': {
         'title': "Saino COC",
@@ -93,7 +76,8 @@ STRINGS = {
         'convert': "📄 تبدیل به PDF",
         'clear': "🧹 پاک‌کردن لیست",
         'remove': "✖ حذف انتخاب‌شده",
-        'image_scale': "مقیاس تصویر:",
+        'res_scale': "مقیاس رزولوشن (%):",
+        'jpeg_quality': "کیفیت JPEG (%):",
         'no_images': "تصویری انتخاب نشده.",
         'zip_error': "باز کردن ZIP با خطا مواجه شد:",
         'created': "PDF ساخته شد:",
@@ -106,90 +90,142 @@ STRINGS = {
         'no_valid': "هیچ تصویر معتبری برای تبدیل یافت نشد.",
         'processing': "در حال پردازش تصاویر...",
         'separate_or_combine': "چند گروه شناسایی شد. برای هر گروه PDF جدا بسازم؟",
-        'yes': "بله",
-        'no': "خیر",
-        'estimate_title': "حجم تقریبی",
-        'estimate_proceed': "حجم تقریبی: {size}\nادامه می‌دهی؟",
-        'combined_name_info': "نام فایل ترکیبی خواهد بود: {name}.pdf",
+        'yes': "جدا",
+        'no': "ترکیب کن",
+        'dropped_images': "تصاویر کشیده شده",
+        'lang_toggle': "FA/EN",
+        'sort_label': "مرتب‌سازی:",
+        'sort_default': "پیش‌فرض",
+        'sort_name': "بر اساس نام",
+        'sort_number': "بر اساس عدد",
+        'tool_window_hint': "حالت مینی",
+        'optimize_pyc': "بهینه‌سازی .pyc"
     }
 }
 
 # ---------------- utilities ----------------
+
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
+
 
 def natural_key(s: str):
     parts = re.split(r"(\d+)", s)
     return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
-def human_size(nbytes):
-    if nbytes < 1024:
-        return f"{nbytes} B"
-    for unit in ["KB", "MB", "GB", "TB"]:
-        nbytes /= 1024.0
-        if abs(nbytes) < 1024.0:
-            return f"{nbytes:.2f} {unit}"
-    return f"{nbytes:.2f} PB"
+def ensure_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
 
 
-def estimate_pdf_size(paths, scale):
-    total = 0
-    for p in paths:
+# ---------------- background cleanup worker ----------------
+class TempCleanupWorker(QThread):
+    """Scan system temp for old temp dirs matching our prefixes and remove them.
+    Runs in background so startup is not blocked.
+    """
+    status = Signal(str)
+
+    def __init__(self, prefixes=None, older_than_hours=24):
+        super().__init__()
+        self._stop = False
+        self.prefixes = prefixes or ['saino_temp_root_', 'saino_zip_', 'saino_combined_', 'saino_proc_']
+        self.older_than = timedelta(hours=older_than_hours)
+
+    def run(self):
+        tmp = tempfile.gettempdir()
+        now = datetime.now()
         try:
-            total += os.path.getsize(p)
+            for name in os.listdir(tmp):
+                if self._stop:
+                    break
+                for p in self.prefixes:
+                    if name.startswith(p):
+                        path = os.path.join(tmp, name)
+                        try:
+                            mtime = datetime.fromtimestamp(os.path.getmtime(path))
+                        except Exception:
+                            mtime = now
+                        if now - mtime > self.older_than:
+                            try:
+                                if os.path.isdir(path):
+                                    shutil.rmtree(path, ignore_errors=True)
+                                else:
+                                    try:
+                                        os.remove(path)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        break
         except Exception:
             pass
-    compression_factor = 0.6
-    return int(total * (scale ** 2) * compression_factor)
+
+    def stop(self):
+        self._stop = True
 
 
-def longest_common_substring(strings):
-    if not strings:
-        return ""
-    s0 = min(strings, key=len)
-    best = ""
-    L = len(s0)
-    for i in range(L):
-        for j in range(i + 1, L + 1):
-            sub = s0[i:j]
-            if len(sub) <= len(best):
-                continue
-            if all(sub in s for s in strings):
-                best = sub
-    return best.strip(" _-.")
+# ---------------- pyc optimize worker ----------------
+class PycOptimizeWorker(QThread):
+    finished = Signal(bool, str)
 
-# ---------------- Worker ----------------
+    def __init__(self, target_dir):
+        super().__init__()
+        self.target_dir = target_dir
+
+    def run(self):
+        try:
+            # compileall returns True/False
+            # optimize=2 for -OO (remove docstrings)
+            ok = compileall.compile_dir(self.target_dir, force=False, optimize=2, quiet=1)
+            self.finished.emit(bool(ok), "Optimized" if ok else "Failed")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+# ---------------- Conversion Worker ----------------
 class ConversionWorker(QThread):
-    progress = Signal(int)  # per-image index (1-based), 0 = new group
-    finished_signal = Signal(list, list)
+    progress = Signal(int)         # overall processed images count
+    finished_signal = Signal(list, list)  # (created_pdfs, skipped_list)
     error = Signal(str)
 
-    def __init__(self, groups_ordered, output_dir, scale, temp_dir):
+    def __init__(self, groups_ordered, output_dir, scale, jpeg_quality, clean_after_group=True):
         super().__init__()
         self.groups = groups_ordered
         self.output_dir = output_dir
-        self.scale = scale
-        self.temp_dir = temp_dir
+        self.scale = float(scale)
+        self.jpeg_quality = int(jpeg_quality)
         self._is_canceled = False
+        self.clean_after_group = clean_after_group
 
     def run(self):
         try:
             created = []
             skipped_all = []
-            for group_name, paths in self.groups:
+            processed_count = 0
+            total_images = sum(len(g['paths']) for g in self.groups)
+            for group in self.groups:
                 if self._is_canceled:
                     break
-                self.progress.emit(0)
-                if not paths:
-                    continue
-                if group_name == '__COMBINED__':
+                name = group['name']
+                paths = group['paths']
+                if name == '__COMBINED__':
                     base = f"combined_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 else:
-                    base = os.path.splitext(group_name)[0]
+                    base = os.path.splitext(name)[0]
                 out_pdf = os.path.join(self.output_dir, f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
-                skipped = self._process_and_save(paths, out_pdf)
+                skipped = self._process_and_save(paths, out_pdf, processed_count, total_images)
                 skipped_all.extend(skipped)
                 if os.path.exists(out_pdf):
                     created.append(out_pdf)
+                processed_count += max(1, len(paths))
+                tdir = group.get('tempdir')
+                if self.clean_after_group and tdir:
+                    try:
+                        shutil.rmtree(tdir, ignore_errors=True)
+                    except Exception:
+                        pass
                 if self._is_canceled:
                     break
             self.finished_signal.emit(created, skipped_all)
@@ -199,17 +235,20 @@ class ConversionWorker(QThread):
     def cancel(self):
         self._is_canceled = True
 
-    def _process_and_save(self, paths, out_pdf):
+    def _process_and_save(self, paths, out_pdf, processed_offset, total_images):
         processed_tmp = []
         skipped = []
+        local_count = 0
         for idx, p in enumerate(paths):
             if self._is_canceled:
                 break
-            self.progress.emit(idx + 1)
+            local_count += 1
             try:
                 img = Image.open(p)
             except Exception as e:
                 skipped.append((p, str(e)))
+                processed_offset += 1
+                self.progress.emit(processed_offset)
                 continue
             try:
                 if img.mode != 'RGB':
@@ -220,14 +259,16 @@ class ConversionWorker(QThread):
                     img.close()
                 except Exception:
                     pass
+                processed_offset += 1
+                self.progress.emit(processed_offset)
                 continue
             try:
                 if self.scale < 1.0:
                     w, h = img.size
                     img = img.resize((max(1, int(w * self.scale)), max(1, int(h * self.scale))), Image.LANCZOS)
-                fd, tmp_path = tempfile.mkstemp(prefix='saino_proc_', suffix='.jpg', dir=self.temp_dir)
+                fd, tmp_path = tempfile.mkstemp(prefix='saino_proc_', suffix='.jpg')
                 os.close(fd)
-                img.save(tmp_path, format='JPEG', quality=85, optimize=True)
+                img.save(tmp_path, format='JPEG', quality=self.jpeg_quality, optimize=True)
                 processed_tmp.append(tmp_path)
             except Exception as e:
                 skipped.append((p, f'processing failed: {e}'))
@@ -237,6 +278,8 @@ class ConversionWorker(QThread):
                 except Exception:
                     pass
             gc.collect()
+            processed_offset += 1
+            self.progress.emit(processed_offset)
 
         pil_list = []
         for f in processed_tmp:
@@ -275,6 +318,7 @@ class ConversionWorker(QThread):
             gc.collect()
         return skipped
 
+
 # ---------------- Main Window ----------------
 class ImageToPDF(QWidget):
     def __init__(self):
@@ -284,60 +328,105 @@ class ImageToPDF(QWidget):
         self.t = lambda k: STRINGS[self.lang].get(k, k)
 
         self.setWindowTitle(self.t('title'))
-        self.setMinimumSize(1000, 650)
+        # mini app look: remove maximize and use tool window flag
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
+        self.setWindowFlag(Qt.Tool, True)
+        self.setMinimumSize(980, 560)
+        self.setMaximumWidth(1400)
 
+        # Tree (left)
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        # enable internal drag & drop move
+        self.tree.setDragEnabled(True)
+        self.tree.setAcceptDrops(True)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setDragDropMode(QAbstractItemView.InternalMove)
+        self.tree.setDefaultDropAction(Qt.MoveAction)
 
+        # Preview (right)
         self.preview_label = QLabel(self.t('preview'))
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setFixedHeight(360)
-        self.preview_label.setStyleSheet("background:#222; border:1px solid #444; color:#ddd;")
+        self.preview_label.setFixedHeight(420)
+        self.preview_label.setStyleSheet("background:#0f0f0f; border:1px solid #2b2b2b; color:#ddd; padding:8px;")
+        preview_font = QFont(); preview_font.setPointSize(11); self.preview_label.setFont(preview_font)
 
-        # buttons
-        load_folder_btn = QPushButton(self.t('load_folder'))
-        load_folder_btn.clicked.connect(self.load_folder)
-        load_zip_btn = QPushButton(self.t('load_zip'))
-        load_zip_btn.clicked.connect(self.load_zip)
-        up_btn = QPushButton(self.t('move_up'))
-        up_btn.clicked.connect(self.move_up)
-        down_btn = QPushButton(self.t('move_down'))
-        down_btn.clicked.connect(self.move_down)
-        convert_btn = QPushButton(self.t('convert'))
-        convert_btn.clicked.connect(self.convert_to_pdf)
-        self.convert_btn = convert_btn
-        clear_btn = QPushButton(self.t('clear'))
-        clear_btn.clicked.connect(self.clear_all)
-        remove_btn = QPushButton(self.t('remove'))
-        remove_btn.clicked.connect(self.remove_selected)
+        # Buttons & controls
+        # Top buttons above preview
+        self.load_folder_btn = QPushButton(self.t('load_folder'))
+        self.load_folder_btn.clicked.connect(self.load_folder)
+        self.load_zip_btn = QPushButton(self.t('load_zip'))
+        self.load_zip_btn.clicked.connect(self.load_zip)
 
-        self.quality_spin = QSpinBox(); self.quality_spin.setRange(10, 100); self.quality_spin.setValue(100); self.quality_spin.setSuffix('%')
-        quality_layout = QFormLayout(); quality_layout.addRow(self.t('image_scale'), self.quality_spin)
+        # Bottom buttons below preview
+        self.up_btn = QPushButton(self.t('move_up')); self.up_btn.clicked.connect(self.move_up)
+        self.down_btn = QPushButton(self.t('move_down')); self.down_btn.clicked.connect(self.move_down)
+        self.remove_btn = QPushButton(self.t('remove')); self.remove_btn.clicked.connect(self.remove_selected)
+        self.clear_btn = QPushButton(self.t('clear')); self.clear_btn.clicked.connect(self.clear_all)
+        self.convert_btn = QPushButton(self.t('convert')); self.convert_btn.clicked.connect(self.convert_to_pdf)
 
-        control_group = QGroupBox('Controls')
-        control_layout = QVBoxLayout()
-        for b in [load_folder_btn, load_zip_btn, up_btn, down_btn, remove_btn, clear_btn, convert_btn]:
-            b.setStyleSheet('padding:8px; font-size:14px;')
-            control_layout.addWidget(b)
-        control_layout.addLayout(quality_layout)
-        control_group.setLayout(control_layout)
+        # Language toggle button
+        self.lang_btn = QPushButton(self.t('lang_toggle'))
+        self.lang_btn.clicked.connect(self.toggle_language)
 
-        left_layout = QVBoxLayout(); left_layout.addWidget(control_group); left_layout.addWidget(self.tree)
-        right_layout = QVBoxLayout(); right_layout.addWidget(self.preview_label)
-        main_layout = QHBoxLayout(); main_layout.addLayout(left_layout, 40); main_layout.addLayout(right_layout, 60)
+        # Optimize .pyc button
+        self.optimize_btn = QPushButton(self.t('optimize_pyc'))
+        self.optimize_btn.clicked.connect(self.optimize_pyc)
+
+        # Sort combobox
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems([self.t('sort_default'), self.t('sort_name'), self.t('sort_number')])
+        self.sort_combo.currentIndexChanged.connect(self.apply_sorting)
+
+        # Controls: resolution scale and jpeg quality
+        self.scale_spin = QSpinBox(); self.scale_spin.setRange(10, 100); self.scale_spin.setValue(100); self.scale_spin.setSuffix('%')
+        self.jpeg_spin = QSpinBox(); self.jpeg_spin.setRange(10, 95); self.jpeg_spin.setValue(85); self.jpeg_spin.setSuffix('%')
+        form = QFormLayout()
+        form.addRow(self.t('res_scale'), self.scale_spin)
+        form.addRow(self.t('jpeg_quality'), self.jpeg_spin)
+
+        # Layout assembly
+        top_btn_layout = QHBoxLayout()
+        top_btn_layout.addWidget(self.load_folder_btn)
+        top_btn_layout.addWidget(self.load_zip_btn)
+        top_btn_layout.addStretch()
+        top_btn_layout.addWidget(self.lang_btn)
+        top_btn_layout.addWidget(self.optimize_btn)
+        top_btn_layout.addWidget(QLabel(self.t('sort_label')))
+        top_btn_layout.addWidget(self.sort_combo)
+
+        bottom_btn_layout = QHBoxLayout()
+        for b in [self.up_btn, self.down_btn, self.remove_btn, self.clear_btn, self.convert_btn]:
+            bottom_btn_layout.addWidget(b)
+        bottom_btn_layout.addStretch()
+
+        right_layout = QVBoxLayout()
+        right_layout.addLayout(top_btn_layout)
+        right_layout.addWidget(self.preview_label)
+        right_layout.addLayout(bottom_btn_layout)
+        right_layout.addLayout(form)
+
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(self.tree)
+
+        main_layout = QHBoxLayout()
+        main_layout.addLayout(left_layout, 36)
+        main_layout.addLayout(right_layout, 64)
         self.setLayout(main_layout)
 
         # internal data
-        self.temp_dir = tempfile.mkdtemp(prefix='saino_temp_')
-        self.source_map = {}  # child_path -> group_basename
-        self.loaded_zip_order = []  # ordered list of zip basenames when load_zip used
+        self.base_temp_root = tempfile.mkdtemp(prefix='saino_temp_root_')
+        self.group_tempdirs = {}            # group_key -> tempdir (or None)
+        self.source_map = {}                # child_path -> group_key
+        self.loaded_zip_order = []          # list of group keys in insertion order
+        self.group_order = {}               # group_key -> list of child paths (in insertion order)
 
-        # drag/drop
+        # Drag/drop
         self.setAcceptDrops(True)
         self.tree.itemDoubleClicked.connect(self.on_item_double_click)
 
-        # keyboard lang toggle
+        # shortcut
         try:
             self.lang_shortcut = QShortcut(QKeySequence('Ctrl+L'), self)
             self.lang_shortcut.activated.connect(self.toggle_language)
@@ -345,86 +434,130 @@ class ImageToPDF(QWidget):
             pass
 
         # progress
-        self.progress_bar = QProgressBar(self); self.progress_bar.setVisible(False); left_layout.addWidget(self.progress_bar)
-        self.worker = None
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setVisible(False)
+        left_layout.addWidget(self.progress_bar)
 
-    # ------------ drag/drop ------------
-    def dragEnterEvent(self, e: QDragEnterEvent):
-        if e.mimeData().hasUrls(): e.acceptProposedAction()
+        self.worker = None
+        self.opt_worker = None
+
+        # start background cleanup (non-blocking) to remove old orphan temp dirs
+        self._start_background_cleanup()
+
+    # prevent maximizing/fullscreen attempts
+    def changeEvent(self, ev):
+        if ev.type() == QEvent.WindowStateChange:
+            st = self.windowState()
+            if st & (Qt.WindowFullScreen | Qt.WindowMaximized):
+                self.setWindowState(Qt.WindowNoState)
+        super().changeEvent(ev)
+
+    def _start_background_cleanup(self):
+        QTimer.singleShot(50, self._launch_cleanup_thread)
+
+    def _launch_cleanup_thread(self):
+        self.cleanup_worker = TempCleanupWorker(older_than_hours=24)
+        self.cleanup_worker.start()
+
+    # drag/drop override to resync mappings after InternalMove
     def dropEvent(self, e: QDropEvent):
-        urls = e.mimeData().urls()
-        zip_paths = []
-        for url in urls:
-            path = url.toLocalFile()
-            if os.path.isdir(path):
-                self._add_folder_group(path)
-            elif zipfile.is_zipfile(path):
-                zip_paths.append(path)
-            else:
-                if path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    # add to a special "Dropped images" group
-                    self._ensure_group('__DROPPED__', 'Dropped Images')
-                    self._add_child('__DROPPED__', path)
-        if zip_paths:
-            zip_paths.sort(key=lambda p: natural_key(os.path.basename(p)))
-            for p in zip_paths:
-                self._add_zip_group(p)
-        e.acceptProposedAction()
+        super().dropEvent(e)
+        QTimer.singleShot(20, self._rebuild_all_mappings)
+
+    def _rebuild_all_mappings(self):
+        new_group_order = {}
+        new_loaded_zip_order = []
+        new_source_map = {}
+        for i in range(self.tree.topLevelItemCount()):
+            root = self.tree.topLevelItem(i)
+            d = root.data(0, Qt.UserRole)
+            if not d or d.get('type') != 'group':
+                continue
+            key = d.get('key')
+            new_loaded_zip_order.append(key)
+            lst = []
+            for j in range(root.childCount()):
+                cp = root.child(j).data(0, Qt.UserRole).get('path')
+                lst.append(cp)
+                new_source_map[cp] = key
+            new_group_order[key] = lst
+        self.group_order = new_group_order
+        self.loaded_zip_order = new_loaded_zip_order
+        self.source_map = new_source_map
 
     # ------------ loading groups ------------
     def load_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, 'Choose Folder')
+        folder = QFileDialog.getExistingDirectory(self, self.t('load_folder'))
         if not folder: return
-        self._add_folder_group(folder, clear_first=True)
-
-    def _add_folder_group(self, folder, clear_first=False):
         basename = os.path.basename(folder)
-        if clear_first:
-            self.clear_all()
-            self.loaded_zip_order = []
         self._ensure_group(basename, basename)
-        entries = [f for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        entries = [f for f in os.listdir(folder) if f.lower().endswith(IMAGE_EXTS)]
         entries.sort(key=natural_key)
         for ent in entries:
             full = os.path.join(folder, ent)
             self._add_child(basename, full)
+        self.group_tempdirs[basename] = None
 
     def load_zip(self):
-        files, _ = QFileDialog.getOpenFileNames(self, 'Choose ZIP File(s)', '', 'ZIP Files (*.zip)')
+        files, _ = QFileDialog.getOpenFileNames(self, self.t('load_zip'), '', 'ZIP Files (*.zip)')
         if not files: return
         files.sort(key=lambda p: natural_key(os.path.basename(p)))
-        self.clear_all()
-        self.loaded_zip_order = [os.path.basename(p) for p in files]
         for p in files:
             self._add_zip_group(p)
 
     def _add_zip_group(self, zip_path, clear_first=False):
         basename = os.path.basename(zip_path)
-        if clear_first:
-            self.clear_all(); self.loaded_zip_order = [basename]
+        # create a unique tempdir for this zip inside base_temp_root
+        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', basename)
+        group_temp = tempfile.mkdtemp(prefix=f'saino_zip_{safe_name}_', dir=self.base_temp_root)
         try:
             with zipfile.ZipFile(zip_path, 'r') as z:
-                names = [n for n in z.namelist() if n.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                # collect image entries
+                names = [n for n in z.namelist() if n.lower().endswith(IMAGE_EXTS)]
                 names.sort(key=natural_key)
                 self._ensure_group(basename, basename)
                 for name in names:
-                    extracted = z.extract(name, self.temp_dir)
-                    self._add_child(basename, extracted)
+                    try:
+                        # extract preserving internal path but under group_temp
+                        extracted = z.extract(name, group_temp)
+                    except Exception:
+                        continue
+                    # normalize path
+                    extracted = os.path.normpath(extracted)
+                    # if extracted is a directory (entry had trailing slash), scan inside
+                    if os.path.isdir(extracted):
+                        for root, _, files in os.walk(extracted):
+                            for f in files:
+                                if f.lower().endswith(IMAGE_EXTS):
+                                    self._add_child(basename, os.path.join(root, f))
+                    else:
+                        if os.path.splitext(extracted)[1].lower() in IMAGE_EXTS:
+                            self._add_child(basename, extracted)
+                self.group_tempdirs[basename] = group_temp
+                if basename not in self.loaded_zip_order:
+                    self.loaded_zip_order.append(basename)
         except Exception as e:
+            try:
+                shutil.rmtree(group_temp, ignore_errors=True)
+            except Exception:
+                pass
             QMessageBox.warning(self, self.t('title'), f"{self.t('zip_error')} {e}")
 
     # ------------ tree helpers ------------
     def _ensure_group(self, key, display_name):
-        # if group with basename exists, return; else create top-level item
         root = self._find_group_item(key)
         if root is None:
             root = QTreeWidgetItem(self.tree)
             root.setText(0, display_name)
             root.setData(0, Qt.UserRole, {'type': 'group', 'key': key})
             root.setExpanded(True)
-            # visual style
             root.setFirstColumnSpanned(True)
             font = root.font(0); font.setBold(True); root.setFont(0, font)
+            # allow drag/drop on group nodes
+            root.setFlags(root.flags() | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+            self.group_order[key] = []
+            if key not in self.loaded_zip_order:
+                self.loaded_zip_order.append(key)
         return root
 
     def _find_group_item(self, key):
@@ -437,6 +570,7 @@ class ImageToPDF(QWidget):
 
     def _add_child(self, group_key, child_path):
         root = self._ensure_group(group_key, group_key)
+        child_path = os.path.normpath(child_path)
         # avoid duplicates
         for i in range(root.childCount()):
             if root.child(i).data(0, Qt.UserRole).get('path') == child_path:
@@ -444,8 +578,14 @@ class ImageToPDF(QWidget):
         child = QTreeWidgetItem(root)
         child.setText(0, os.path.basename(child_path))
         child.setData(0, Qt.UserRole, {'type': 'image', 'path': child_path})
+        # make draggable
+        child.setFlags(child.flags() | Qt.ItemIsDragEnabled | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
         root.addChild(child)
         self.source_map[child_path] = group_key
+        # maintain insertion order
+        if group_key not in self.group_order:
+            self.group_order[group_key] = []
+        self.group_order[group_key].append(child_path)
 
     # ------------ UI behavior ------------
     def on_item_double_click(self, item, col):
@@ -459,6 +599,7 @@ class ImageToPDF(QWidget):
         img = QImage(path)
         if img.isNull():
             self.preview_label.setText(self.t('preview'))
+            self.preview_label.setPixmap(QPixmap())
             return
         scaled = img.scaled(self.preview_label.width(), self.preview_label.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview_label.setPixmap(QPixmap.fromImage(scaled))
@@ -474,12 +615,14 @@ class ImageToPDF(QWidget):
             if idx > 0:
                 self.tree.takeTopLevelItem(idx)
                 self.tree.insertTopLevelItem(idx - 1, it)
+                self._rebuild_all_mappings()
         elif d.get('type') == 'image':
             parent = it.parent()
             idx = parent.indexOfChild(it)
             if idx > 0:
                 parent.removeChild(it)
                 parent.insertChild(idx - 1, it)
+                self._rebuild_all_mappings()
 
     def move_down(self):
         it = self.tree.currentItem()
@@ -491,12 +634,14 @@ class ImageToPDF(QWidget):
             if idx < self.tree.topLevelItemCount() - 1:
                 self.tree.takeTopLevelItem(idx)
                 self.tree.insertTopLevelItem(idx + 1, it)
+                self._rebuild_all_mappings()
         elif d.get('type') == 'image':
             parent = it.parent()
             idx = parent.indexOfChild(it)
             if idx < parent.childCount() - 1:
                 parent.removeChild(it)
                 parent.insertChild(idx + 1, it)
+                self._rebuild_all_mappings()
 
     def remove_selected(self):
         it = self.tree.currentItem()
@@ -504,31 +649,74 @@ class ImageToPDF(QWidget):
         d = it.data(0, Qt.UserRole)
         if not d: return
         if d.get('type') == 'group':
-            # remove whole group
             idx = self.tree.indexOfTopLevelItem(it)
+            key = d.get('key')
+            tdir = self.group_tempdirs.get(key)
+            if tdir:
+                try: shutil.rmtree(tdir, ignore_errors=True)
+                except Exception: pass
+                self.group_tempdirs.pop(key, None)
             self.tree.takeTopLevelItem(idx)
-            # remove associated source_map entries
-            # iterate children paths
             for i in range(it.childCount()):
                 child = it.child(i)
                 cp = child.data(0, Qt.UserRole).get('path')
                 try: del self.source_map[cp]
-                except: pass
+                except Exception: pass
+            try: del self.group_order[key]
+            except Exception: pass
+            try: self.loaded_zip_order.remove(key)
+            except Exception: pass
         else:
             parent = it.parent()
             cp = it.data(0, Qt.UserRole).get('path')
             parent.removeChild(it)
             try: del self.source_map[cp]
-            except: pass
+            except Exception: pass
+            self._rebuild_all_mappings()
 
     def clear_all(self):
-        self.tree.clear(); self.source_map.clear(); self.loaded_zip_order = []
+        for t in list(self.group_tempdirs.values()):
+            if t:
+                try: shutil.rmtree(t, ignore_errors=True)
+                except Exception: pass
+        self.group_tempdirs.clear()
+        self.tree.clear()
+        self.source_map.clear()
+        self.loaded_zip_order = []
+        self.group_order.clear()
         self.preview_label.setText(self.t('preview'))
+        self.preview_label.setPixmap(QPixmap())
+
+    # ------------ sorting ------------
+    def apply_sorting(self):
+        idx = self.sort_combo.currentIndex()
+        mode = 'default' if idx == 0 else ('name' if idx == 1 else 'number')
+        for i in range(self.tree.topLevelItemCount()):
+            root = self.tree.topLevelItem(i)
+            d = root.data(0, Qt.UserRole)
+            if not d or d.get('type') != 'group':
+                continue
+            key = d.get('key')
+            children = [root.child(j).data(0, Qt.UserRole).get('path') for j in range(root.childCount())]
+            if mode == 'default':
+                order = self.group_order.get(key, children)
+            elif mode == 'name':
+                order = sorted(children, key=lambda p: os.path.basename(p).lower())
+            else:
+                order = sorted(children, key=lambda p: natural_key(os.path.basename(p)))
+            mapping = {root.child(j).data(0, Qt.UserRole).get('path'): root.child(j) for j in range(root.childCount())}
+            while root.childCount():
+                root.takeChild(0)
+            for p in order:
+                if p in mapping:
+                    root.addChild(mapping[p])
+            if mode == 'default':
+                self.group_order[key] = order
 
     # ------------ conversion UI flow ------------
     def convert_to_pdf(self):
         # gather groups in tree order
-        groups = []  # list of (group_name, [paths])
+        groups = []
         for i in range(self.tree.topLevelItemCount()):
             root = self.tree.topLevelItem(i)
             d = root.data(0, Qt.UserRole)
@@ -547,79 +735,95 @@ class ImageToPDF(QWidget):
             QMessageBox.warning(self, self.t('title'), self.t('no_images'))
             return
 
-        # detect multiple groups
         multiple_groups = len(groups) > 1
         combine_mode = False
         if multiple_groups:
-            # bilingual dialog: Yes = separate, No = combine
             msg = QMessageBox(self)
             msg.setWindowTitle(self.t('title'))
             msg.setText(self.t('separate_or_combine'))
-            btn_yes = msg.addButton(self.t('yes'), QMessageBox.YesRole)
-            btn_no = msg.addButton(self.t('no'), QMessageBox.NoRole)
+            btn_sep = msg.addButton(self.t('yes'), QMessageBox.YesRole)
+            btn_comb = msg.addButton(self.t('no'), QMessageBox.NoRole)
             msg.exec()
             clicked = msg.clickedButton()
-            if clicked == btn_yes:
+            if clicked == btn_sep:
                 combine_mode = False
             else:
                 combine_mode = True
 
         groups_ordered = []
         if multiple_groups and not combine_mode:
-            # keep groups in current tree order
             for gname, paths in groups:
-                groups_ordered.append((gname, paths))
+                groups_ordered.append({
+                    'name': gname,
+                    'paths': paths,
+                    'tempdir': self.group_tempdirs.get(gname),
+                    'is_combined_group': False
+                })
         else:
-            # single combined group in tree order
+            # build combined temp and copy files with zero-padded sequence prefixes
+            combined_temp = tempfile.mkdtemp(prefix='saino_combined_', dir=self.base_temp_root)
             all_paths = []
+            total_images = 0
             for _, paths in groups:
-                all_paths.extend(paths)
-            groups_ordered.append(('__COMBINED__', all_paths))
+                total_images += len(paths)
+            pad = max(6, len(str(total_images)))
+            seq = 1
+            for i in range(self.tree.topLevelItemCount()):
+                root = self.tree.topLevelItem(i)
+                d = root.data(0, Qt.UserRole)
+                if not d or d.get('type') != 'group':
+                    continue
+                for j in range(root.childCount()):
+                    child = root.child(j)
+                    pd = child.data(0, Qt.UserRole)
+                    if pd and pd.get('type') == 'image':
+                        src = pd.get('path')
+                        ext = os.path.splitext(src)[1].lower()
+                        newname = f"{seq:0{pad}d}_{os.path.basename(src)}"
+                        dst = os.path.join(combined_temp, newname)
+                        try:
+                            shutil.copy2(src, dst)
+                            all_paths.append(dst)
+                        except Exception:
+                            all_paths.append(src)
+                        seq += 1
+            groups_ordered.append({
+                'name': '__COMBINED__',
+                'paths': all_paths,
+                'tempdir': combined_temp,
+                'is_combined_group': True
+            })
 
-        # estimate
-        scale = self.quality_spin.value() / 100.0
-        total_est = sum(estimate_pdf_size(pths, scale) for _, pths in groups_ordered)
-
-        # If combined and there are multiple group names, try to create meaningful filename
-        combined_name = None
-        if len(groups_ordered) == 1 and groups_ordered[0][0] == '__COMBINED__':
-            group_keys = [g.data(0, Qt.UserRole).get('key') for g in [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]]
-            lcs = longest_common_substring(group_keys)
-            if lcs and len(lcs) >= 3:
-                combined_name = lcs
-            else:
-                combined_name = f"combined_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        est_text = self.t('estimate_proceed').format(size=human_size(total_est))
-        if combined_name:
-            est_text += "\n" + self.t('combined_name_info').format(name=combined_name)
-
-        reply = QMessageBox.question(self, self.t('estimate_title'), est_text, QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        out_dir = os.path.join(os.getcwd(), 'output_pdfs'); os.makedirs(out_dir, exist_ok=True)
+        total_images = sum(len(g['paths']) for g in groups_ordered)
+        if total_images <= 0:
+            QMessageBox.warning(self, self.t('title'), self.t('no_valid'))
+            for g in groups_ordered:
+                tdir = g.get('tempdir')
+                if tdir and g.get('is_combined_group'):
+                    try: shutil.rmtree(tdir, ignore_errors=True)
+                    except Exception: pass
             return
 
-        # prepare worker
-        out_dir = os.path.join(os.getcwd(), 'output_pdfs'); os.makedirs(out_dir, exist_ok=True)
+        scale = self.scale_spin.value() / 100.0
+        jpeg_q = self.jpeg_spin.value()
+
         self.progress_bar.setVisible(True)
-        max_images = max((len(p) for _, p in groups_ordered), default=1)
-        self.progress_bar.setMaximum(max_images)
+        self.progress_bar.setMaximum(total_images)
         self.progress_bar.setValue(0)
         self.convert_btn.setEnabled(False)
 
-        self.worker = ConversionWorker(groups_ordered=groups_ordered, output_dir=out_dir, scale=scale, temp_dir=self.temp_dir)
+        self.worker = ConversionWorker(groups_ordered=groups_ordered, output_dir=out_dir, scale=scale, jpeg_quality=jpeg_q, clean_after_group=True)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_signal.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
         self.worker.start()
 
-        # store combined_name to rename later
-        self._combined_name = combined_name
-
     def _on_progress(self, v):
-        if v == 0:
-            self.progress_bar.setValue(0)
-        else:
-            self.progress_bar.setValue(v)
+        try:
+            self.progress_bar.setValue(min(self.progress_bar.maximum(), v))
+        except Exception:
+            pass
 
     def _on_error(self, m):
         QMessageBox.critical(self, self.t('title'), m)
@@ -631,21 +835,8 @@ class ImageToPDF(QWidget):
             QMessageBox.warning(self, self.t('title'), self.t('no_valid'))
             return
 
-        # if combined and single created name, rename to combined_name if available
-        if len(created_pdfs) == 1 and getattr(self, '_combined_name', None):
-            cur = created_pdfs[0]
-            dirp = os.path.dirname(cur)
-            new = os.path.join(dirp, f"{self._combined_name}.pdf")
-            try:
-                if os.path.exists(new):
-                    new = os.path.join(dirp, f"{self._combined_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
-                os.rename(cur, new)
-                created_pdfs[0] = new
-            except Exception:
-                pass
-
-        # dialog (bilingual)
-        msg = QMessageBox(self); msg.setWindowTitle(self.t('open_options_title'))
+        msg = QMessageBox(self)
+        msg.setWindowTitle(self.t('open_options_title'))
         if len(created_pdfs) == 1:
             msg.setText(f"{self.t('created')}\n{created_pdfs[0]}")
             btn_open = msg.addButton(self.t('open_file'), QMessageBox.AcceptRole)
@@ -658,17 +849,23 @@ class ImageToPDF(QWidget):
         clicked = msg.clickedButton()
         if clicked == btn_open and btn_open is not None:
             try:
-                if sys.platform.startswith('win'): os.startfile(created_pdfs[0])
-                elif sys.platform == 'darwin': subprocess.Popen(['open', created_pdfs[0]])
-                else: subprocess.Popen(['xdg-open', created_pdfs[0]])
+                if sys.platform.startswith('win'):
+                    os.startfile(created_pdfs[0])
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', created_pdfs[0]])
+                else:
+                    subprocess.Popen(['xdg-open', created_pdfs[0]])
             except Exception:
                 pass
         elif clicked == btn_open_folder:
             out_dir = os.path.dirname(created_pdfs[0]) if created_pdfs else os.path.join(os.getcwd(), 'output_pdfs')
             try:
-                if sys.platform.startswith('win'): os.startfile(out_dir)
-                elif sys.platform == 'darwin': subprocess.Popen(['open', out_dir])
-                else: subprocess.Popen(['xdg-open', out_dir])
+                if sys.platform.startswith('win'):
+                    os.startfile(out_dir)
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', out_dir])
+                else:
+                    subprocess.Popen(['xdg-open', out_dir])
             except Exception:
                 pass
 
@@ -681,7 +878,7 @@ class ImageToPDF(QWidget):
     def _cleanup_after_worker(self):
         try:
             if self.worker and self.worker.isRunning():
-                self.worker.cancel(); self.worker.wait(100)
+                self.worker.cancel(); self.worker.wait(200)
         except Exception:
             pass
         self.worker = None
@@ -690,32 +887,46 @@ class ImageToPDF(QWidget):
         self.progress_bar.setValue(0)
         gc.collect()
 
-    def _on_error(self, m):
-        QMessageBox.critical(self, self.t('title'), m)
-        self._cleanup_after_worker()
+    def optimize_pyc(self):
+        # run compileall in background for the script directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.optimize_btn.setEnabled(False)
+        self.opt_worker = PycOptimizeWorker(script_dir)
+        self.opt_worker.finished.connect(self._on_opt_finished)
+        self.opt_worker.start()
+
+    def _on_opt_finished(self, ok, msg):
+        self.optimize_btn.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, self.t('title'), f"Optimize finished: {msg}")
+        else:
+            QMessageBox.warning(self, self.t('title'), f"Optimize failed: {msg}")
 
     def toggle_language(self):
         self.lang = LANG_EN if self.lang == LANG_FA else LANG_FA
         self.t = lambda k: STRINGS[self.lang].get(k, k)
         self.setWindowTitle(self.t('title'))
-        # update buttons and preview label
-        for w in self.findChildren(QPushButton):
-            txt = w.text()
-            if 'Load' in txt or 'بارگذاری' in txt or '📁' in txt:
-                w.setText(self.t('load_folder'))
-            elif 'ZIP' in txt or 'ZIP' in txt:
-                w.setText(self.t('load_zip'))
-            elif 'Move Up' in txt or 'بالا' in txt or '⬆' in txt:
-                w.setText(self.t('move_up'))
-            elif 'Move Down' in txt or 'پایین' in txt or '⬇' in txt:
-                w.setText(self.t('move_down'))
-            elif 'Convert' in txt or 'تبدیل' in txt or '📄' in txt:
-                w.setText(self.t('convert'))
-            elif 'Clear' in txt or 'پاک' in txt or '🧹' in txt:
-                w.setText(self.t('clear'))
-            elif 'Remove' in txt or 'حذف' in txt or '✖' in txt:
-                w.setText(self.t('remove'))
+        self.load_folder_btn.setText(self.t('load_folder'))
+        self.load_zip_btn.setText(self.t('load_zip'))
+        self.up_btn.setText(self.t('move_up'))
+        self.down_btn.setText(self.t('move_down'))
+        self.remove_btn.setText(self.t('remove'))
+        self.clear_btn.setText(self.t('clear'))
+        self.convert_btn.setText(self.t('convert'))
+        self.lang_btn.setText(self.t('lang_toggle'))
+        self.optimize_btn.setText(self.t('optimize_pyc'))
+        # update form labels
+        # rebuild sort combo entries
+        self.sort_combo.blockSignals(True)
+        self.sort_combo.clear()
+        self.sort_combo.addItems([self.t('sort_default'), self.t('sort_name'), self.t('sort_number')])
+        self.sort_combo.blockSignals(False)
+        # update preview
         self.preview_label.setText(self.t('preview'))
+        # update dropped group name if exists
+        dropped_item = self._find_group_item('__DROPPED__')
+        if dropped_item:
+            dropped_item.setText(0, self.t('dropped_images'))
 
     def closeEvent(self, ev):
         try:
@@ -724,13 +935,27 @@ class ImageToPDF(QWidget):
         except Exception:
             pass
         try:
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            if hasattr(self, 'cleanup_worker') and self.cleanup_worker.isRunning():
+                self.cleanup_worker.stop(); self.cleanup_worker.wait(200)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(self.base_temp_root):
+                shutil.rmtree(self.base_temp_root, ignore_errors=True)
+            for t in list(self.group_tempdirs.values()):
+                if t:
+                    shutil.rmtree(t, ignore_errors=True)
         except Exception:
             pass
         super().closeEvent(ev)
 
+
 # ---------- run ----------
 if __name__ == '__main__':
+    if sys.platform.startswith("win"):
+        sys.stdout = None
+        sys.stderr = None
+
     app = QApplication(sys.argv)
     w = ImageToPDF()
     w.show()
