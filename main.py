@@ -26,8 +26,8 @@ from PySide6.QtCore import Qt, QThread, Signal, QEvent, QTimer
 from PIL import Image
 
 # ---------------- i18n ----------------
-LANG_EN = 'en'
 LANG_FA = 'fa'
+LANG_EN = 'en'
 
 STRINGS = {
     'en': {
@@ -357,7 +357,7 @@ class ImageToPDF(QWidget):
 
         # Controls: resolution scale and jpeg quality
         self.scale_spin = QSpinBox(); self.scale_spin.setRange(10, 100); self.scale_spin.setValue(100); self.scale_spin.setSuffix('%')
-        self.jpeg_spin = QSpinBox(); self.jpeg_spin.setRange(10, 95); self.jpeg_spin.setValue(85); self.jpeg_spin.setSuffix('%')
+        self.jpeg_spin = QSpinBox(); self.jpeg_spin.setRange(10, 100); self.jpeg_spin.setValue(95); self.jpeg_spin.setSuffix('%')
         form = QFormLayout()
         form.addRow(self.t('res_scale'), self.scale_spin)
         form.addRow(self.t('jpeg_quality'), self.jpeg_spin)
