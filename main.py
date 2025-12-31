@@ -302,8 +302,7 @@ class ConversionWorker(QThread):
 class ImageToPDF(QWidget):
     def __init__(self):
         super().__init__()
-        env_lang = os.environ.get('LANG', '')
-        self.lang = LANG_FA if 'fa' in env_lang.lower() or 'fa_IR' in env_lang else LANG_EN
+        self.lang = LANG_FA
         self.t = lambda k: STRINGS[self.lang].get(k, k)
 
         self.setWindowTitle(self.t('title'))
