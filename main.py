@@ -5,7 +5,6 @@ import tempfile
 import shutil
 import subprocess
 import gc
-import compileall
 import time
 import re
 from datetime import datetime, timedelta
@@ -15,7 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QFileDialog,
     QTreeWidget, QTreeWidgetItem, QLabel, QMessageBox, QHBoxLayout,
     QAbstractItemView, QSpinBox, QFormLayout, QProgressBar,
-    QSizePolicy, QComboBox, QFrame
+    QSizePolicy, QComboBox
 )
 try:
     from PySide6.QtWidgets import QShortcut
@@ -64,7 +63,6 @@ STRINGS = {
         'sort_name': "By Name",
         'sort_number': "By Number",
         'tool_window_hint': "Mini mode",
-        'optimize_pyc': "Optimize .pyc"
     },
     'fa': {
         'title': "Saino COC",
@@ -99,7 +97,6 @@ STRINGS = {
         'sort_name': "بر اساس نام",
         'sort_number': "بر اساس عدد",
         'tool_window_hint': "حالت مینی",
-        'optimize_pyc': "بهینه‌سازی .pyc"
     }
 }
 
@@ -164,24 +161,6 @@ class TempCleanupWorker(QThread):
 
     def stop(self):
         self._stop = True
-
-
-# ---------------- pyc optimize worker ----------------
-class PycOptimizeWorker(QThread):
-    finished = Signal(bool, str)
-
-    def __init__(self, target_dir):
-        super().__init__()
-        self.target_dir = target_dir
-
-    def run(self):
-        try:
-            # compileall returns True/False
-            # optimize=2 for -OO (remove docstrings)
-            ok = compileall.compile_dir(self.target_dir, force=False, optimize=2, quiet=1)
-            self.finished.emit(bool(ok), "Optimized" if ok else "Failed")
-        except Exception as e:
-            self.finished.emit(False, str(e))
 
 
 # ---------------- Conversion Worker ----------------
@@ -328,9 +307,10 @@ class ImageToPDF(QWidget):
         self.t = lambda k: STRINGS[self.lang].get(k, k)
 
         self.setWindowTitle(self.t('title'))
-        # mini app look: remove maximize and use tool window flag
+        # Use normal window flags (so it appears in taskbar)
+        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
+        # prevent maximize
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
-        self.setWindowFlag(Qt.Tool, True)
         self.setMinimumSize(980, 560)
         self.setMaximumWidth(1400)
 
@@ -370,10 +350,6 @@ class ImageToPDF(QWidget):
         self.lang_btn = QPushButton(self.t('lang_toggle'))
         self.lang_btn.clicked.connect(self.toggle_language)
 
-        # Optimize .pyc button
-        self.optimize_btn = QPushButton(self.t('optimize_pyc'))
-        self.optimize_btn.clicked.connect(self.optimize_pyc)
-
         # Sort combobox
         self.sort_combo = QComboBox()
         self.sort_combo.addItems([self.t('sort_default'), self.t('sort_name'), self.t('sort_number')])
@@ -392,7 +368,6 @@ class ImageToPDF(QWidget):
         top_btn_layout.addWidget(self.load_zip_btn)
         top_btn_layout.addStretch()
         top_btn_layout.addWidget(self.lang_btn)
-        top_btn_layout.addWidget(self.optimize_btn)
         top_btn_layout.addWidget(QLabel(self.t('sort_label')))
         top_btn_layout.addWidget(self.sort_combo)
 
@@ -439,7 +414,6 @@ class ImageToPDF(QWidget):
         left_layout.addWidget(self.progress_bar)
 
         self.worker = None
-        self.opt_worker = None
 
         # start background cleanup (non-blocking) to remove old orphan temp dirs
         self._start_background_cleanup()
@@ -878,7 +852,7 @@ class ImageToPDF(QWidget):
     def _cleanup_after_worker(self):
         try:
             if self.worker and self.worker.isRunning():
-                self.worker.cancel(); self.worker.wait(200)
+                self.worker.cancel(); self.worker.wait(1000)
         except Exception:
             pass
         self.worker = None
@@ -886,21 +860,6 @@ class ImageToPDF(QWidget):
         self.progress_bar.setVisible(False)
         self.progress_bar.setValue(0)
         gc.collect()
-
-    def optimize_pyc(self):
-        # run compileall in background for the script directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.optimize_btn.setEnabled(False)
-        self.opt_worker = PycOptimizeWorker(script_dir)
-        self.opt_worker.finished.connect(self._on_opt_finished)
-        self.opt_worker.start()
-
-    def _on_opt_finished(self, ok, msg):
-        self.optimize_btn.setEnabled(True)
-        if ok:
-            QMessageBox.information(self, self.t('title'), f"Optimize finished: {msg}")
-        else:
-            QMessageBox.warning(self, self.t('title'), f"Optimize failed: {msg}")
 
     def toggle_language(self):
         self.lang = LANG_EN if self.lang == LANG_FA else LANG_FA
@@ -914,8 +873,6 @@ class ImageToPDF(QWidget):
         self.clear_btn.setText(self.t('clear'))
         self.convert_btn.setText(self.t('convert'))
         self.lang_btn.setText(self.t('lang_toggle'))
-        self.optimize_btn.setText(self.t('optimize_pyc'))
-        # update form labels
         # rebuild sort combo entries
         self.sort_combo.blockSignals(True)
         self.sort_combo.clear()
@@ -929,16 +886,21 @@ class ImageToPDF(QWidget):
             dropped_item.setText(0, self.t('dropped_images'))
 
     def closeEvent(self, ev):
+        # Cancel conversion worker and wait
         try:
             if self.worker and self.worker.isRunning():
-                self.worker.cancel(); self.worker.wait(200)
+                self.worker.cancel()
+                self.worker.wait(1000)
         except Exception:
             pass
+        # Stop cleanup worker and wait
         try:
             if hasattr(self, 'cleanup_worker') and self.cleanup_worker.isRunning():
-                self.cleanup_worker.stop(); self.cleanup_worker.wait(200)
+                self.cleanup_worker.stop()
+                self.cleanup_worker.wait(1000)
         except Exception:
             pass
+        # Remove temp dirs
         try:
             if os.path.exists(self.base_temp_root):
                 shutil.rmtree(self.base_temp_root, ignore_errors=True)
@@ -948,15 +910,16 @@ class ImageToPDF(QWidget):
         except Exception:
             pass
         super().closeEvent(ev)
+        # Ensure QApplication exits when window closed
+        QApplication.quit()
 
 
 # ---------- run ----------
 if __name__ == '__main__':
-    if sys.platform.startswith("win"):
-        sys.stdout = None
-        sys.stderr = None
-
+    # Note: keep console disabled at compile-time (e.g. with Nuitka flag --windows-console-mode=disable)
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+
     w = ImageToPDF()
     w.show()
     sys.exit(app.exec())
